@@ -1,0 +1,25 @@
+# 网络切换配置文件
+# 复制本文件为 network_config.ini，并根据实际情况修改以下配置
+# 注意：network_config.ini 已加入 .gitignore，不会提交到版本库
+
+# WiFi网卡名称（可在"控制面板 > 网络和Internet > 网络连接"中查看）
+WIFI_ADAPTER_NAME=WLAN
+
+# 有线网卡名称
+ETHERNET_ADAPTER_NAME=以太网
+
+# WiFi名称（SSID）- 运行下方命令查看可用WiFi: netsh wlan show networks
+WIFI_SSID=your_wifi_ssid
+
+# WiFi密码
+WIFI_PASSWORD=your_wifi_password
+
+# 切换到有线时启动的程序路径（可选，如不需要可留空）
+ETHERNET_PROGRAM_PATH=
+
+# 使用说明：
+# 1. 首先在Windows命令行中运行 "netsh interface show interface" 查看你的网卡名称
+# 2. 将上面的网卡名称填入 WIFI_ADAPTER_NAME 和 ETHERNET_ADAPTER_NAME
+# 3. 填入你的WiFi名称和密码
+# 4. 如果切换到有线时需要启动某个程序，请填入完整路径
+# 5. 需要以管理员权限运行程序才能切换网卡

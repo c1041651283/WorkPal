@@ -1,0 +1,6 @@
+pystray~=0.19.5
+pillow~=10.4.0
+PyAutoGUI~=0.9.54
+wmi~=1.5.1
+psutil~=6.0.0
+pywin32
