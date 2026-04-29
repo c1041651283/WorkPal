@@ -1,176 +1,178 @@
 """
 scripts/gen_icons.py
-程序化生成所有托盘图标（零版权风险）。
+从 Iconify 公共 API 下载 Fluent UI System Icons（Microsoft，MIT 协议）
+并生成多尺寸 ICO 托盘图标。
 
 运行方式：
     python scripts/gen_icons.py
 
-输出到 assets/ 目录（32x32 多尺寸 ICO）：
-  icon_default.ico   — 深灰底 + 白色 WiFi 扇形（默认/空闲）
-  icon_wifi.ico      — 蓝底   + 白色 WiFi 扇形（WiFi 模式）
-  icon_ethernet.ico  — 绿底   + 白色以太网端口符号（有线模式）
-  icon_switching.ico — 橙底   + 白色旋转双箭头（切换中）
-  icon_alive.ico     — 紫底   + 白色心跳线（保持在线激活）
+输出到 assets/ 目录（16/24/32/48 多尺寸 ICO）：
+  icon_default.ico   — 深灰底 + WiFi-off 图标（默认/空闲）
+  icon_wifi.ico      — 蓝底   + WiFi 图标（WiFi 模式）
+  icon_ethernet.ico  — 绿底   + 插头图标（有线模式）
+  icon_switching.ico — 橙底   + 同步箭头图标（切换中）
+  icon_alive.ico     — 紫底   + 心跳图标（保持在线激活）
+
+图标来源：Fluent UI System Icons by Microsoft Corporation
+许可证：MIT — https://github.com/microsoft/fluentui-system-icons/blob/main/LICENSE
 """
 
+import io
 import os
-import math
+import tempfile
+import urllib.request
+
 from PIL import Image, ImageDraw
+
+try:
+    from svglib.svglib import svg2rlg
+    from reportlab.graphics import renderPM
+    _SVG_AVAILABLE = True
+except ImportError:
+    _SVG_AVAILABLE = False
 
 # 输出目录（相对于项目根目录）
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'assets')
 
 # 图标尺寸（生成多尺寸 ICO）
-SIZES = [16, 24, 32, 48]
-MAIN_SIZE = 32  # 主绘制画布大小
+SIZES = [16, 24, 32, 48, 64, 128, 256]
 
-# 配色方案
+# 配色方案（背景色）
 COLORS = {
-    'default':   ('#4a4a4a', '#ffffff'),  # 深灰底，白色图案
-    'wifi':      ('#1a73e8', '#ffffff'),  # 蓝底，白色图案
-    'ethernet':  ('#0f9d58', '#ffffff'),  # 绿底，白色图案
-    'switching': ('#f4a300', '#ffffff'),  # 橙底，白色图案
-    'alive':     ('#7b3fa0', '#ffffff'),  # 紫底，白色图案
+    'default':   '#3c3c3c',  # 深灰
+    'wifi':      '#1a73e8',  # 蓝
+    'ethernet':  '#0f9d58',  # 绿
+    'switching': '#f29900',  # 橙
+    'alive':     '#7b3fa0',  # 紫
+}
+
+# Iconify API：Fluent UI System Icons（MIT 协议）
+# 用黑色下载，渲染后反转为白色 + alpha 蒙版，再叠加背景色
+_ICONIFY_BASE = 'https://api.iconify.design/fluent/{icon}.svg?color=%23000000&width=96&height=96'
+ICON_SOURCES = {
+    'default':   'wifi-off-24-filled',
+    'wifi':      'wifi-1-24-filled',
+    'ethernet':  'plug-connected-24-filled',
+    'switching': 'arrow-sync-24-filled',
+    'alive':     'heart-pulse-24-filled',
 }
 
 
-def _make_base(size: int, bg_color: str) -> tuple:
-    """创建圆角矩形背景画布。"""
-    img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+def _fetch_svg(icon_id: str) -> str:
+    """从 Iconify API 下载 SVG 文本（白色图标，96px 视口）。"""
+    url = _ICONIFY_BASE.format(icon=icon_id)
+    req = urllib.request.Request(url, headers={'User-Agent': 'WorkPal-IconGen/1.0'})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return resp.read().decode('utf-8')
+
+
+def _svg_to_pil(svg_text: str, render_size: int) -> Image.Image:
+    """将 SVG 文本渲染为指定尺寸的白色图标（RGBA，透明背景）。"""
+    if not _SVG_AVAILABLE:
+        raise RuntimeError('需要安装 svglib 和 reportlab：pip install svglib reportlab')
+
+    with tempfile.NamedTemporaryFile(suffix='.svg', delete=False, mode='w', encoding='utf-8') as f:
+        f.write(svg_text)
+        tmp_path = f.name
+
+    try:
+        drawing = svg2rlg(tmp_path)
+        if drawing is None:
+            raise ValueError('svglib 无法解析 SVG')
+
+        # 等比缩放到目标尺寸（超采样：4倍后缩小以获得抗锯齿）
+        oversample = 4
+        src_w = drawing.width or 96
+        src_h = drawing.height or 96
+        large = render_size * oversample
+        scale = large / max(src_w, src_h)
+        drawing.width = large
+        drawing.height = large
+        drawing.transform = (scale, 0, 0, scale, 0, 0)
+
+        # 以白色背景渲染（SVG 图标是黑色），得到黑色图标 + 白色背景
+        png_bytes = renderPM.drawToString(drawing, fmt='PNG', bg=0xFFFFFF)
+        raw = Image.open(io.BytesIO(png_bytes)).convert('L')  # 转灰度
+
+        # 缩小到目标尺寸（LANCZOS 抗锯齿）
+        raw = raw.resize((render_size, render_size), Image.LANCZOS)
+
+        # 将灰度亮度取反作为 alpha：黑色(0)→完全不透明，白色(255)→完全透明
+        from PIL import ImageOps
+        alpha = ImageOps.invert(raw)
+
+        # 合成：白色像素 + 以灰度亮度反转值为 alpha
+        white = Image.new('RGBA', (render_size, render_size), (255, 255, 255, 255))
+        white.putalpha(alpha)
+        return white
+    finally:
+        os.unlink(tmp_path)
+
+
+def _make_rounded_bg(size: int, color: str) -> Image.Image:
+    """创建圆角矩形背景（带超采样抗锯齿）。"""
+    scale = 4
+    s = size * scale
+    img = Image.new('RGBA', (s, s), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    radius = size // 5
-    draw.rounded_rectangle([0, 0, size - 1, size - 1], radius=radius, fill=bg_color)
-    return img, draw
+    radius = s // 5
+    draw.rounded_rectangle([0, 0, s - 1, s - 1], radius=radius, fill=color)
+    return img.resize((size, size), Image.LANCZOS)
 
 
-def _draw_wifi(draw: ImageDraw.Draw, size: int, color: str) -> None:
-    """绘制 WiFi 扇形符号（三段弧 + 圆点）。"""
-    cx, cy = size * 0.5, size * 0.62
-    dot_r = size * 0.06
-    # 圆点
-    draw.ellipse(
-        [cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r],
-        fill=color,
-    )
-    # 三段弧（由内到外）
-    for i, (r_inner, r_outer) in enumerate([
-        (size * 0.14, size * 0.22),
-        (size * 0.26, size * 0.34),
-        (size * 0.38, size * 0.46),
-    ]):
-        bbox = [cx - r_outer, cy - r_outer, cx + r_outer, cy + r_outer]
-        draw.arc(bbox, start=210, end=330, fill=color, width=max(1, int(r_outer - r_inner)))
-
-
-def _draw_ethernet(draw: ImageDraw.Draw, size: int, color: str) -> None:
-    """绘制以太网端口符号（矩形外框 + 内部横线）。"""
-    lw = max(1, size // 16)
-    margin = size * 0.18
-    port_w = size * 0.62
-    port_h = size * 0.46
-    x0 = (size - port_w) / 2
-    y0 = (size - port_h) / 2
-
-    # 外框
-    draw.rectangle([x0, y0, x0 + port_w, y0 + port_h], outline=color, width=lw)
-
-    # 内部 4 条竖线（模拟网口针脚）
-    pin_count = 4
-    gap = port_w / (pin_count + 1)
-    pin_h = port_h * 0.55
-    pin_y0 = y0 + port_h * 0.22
-    for i in range(pin_count):
-        px = x0 + gap * (i + 1)
-        draw.line([px, pin_y0, px, pin_y0 + pin_h], fill=color, width=lw)
-
-    # 下方连接线（Tab）
-    tab_w = port_w * 0.3
-    tab_h = size * 0.12
-    tx0 = (size - tab_w) / 2
-    ty0 = y0 + port_h
-    draw.rectangle([tx0, ty0, tx0 + tab_w, ty0 + tab_h], fill=color)
-
-
-def _draw_switching(draw: ImageDraw.Draw, size: int, color: str) -> None:
-    """绘制旋转双箭头（顺时针 + 逆时针各一段弧 + 箭头头部）。"""
-    cx, cy = size / 2, size / 2
-    r = size * 0.32
-    lw = max(1, size // 10)
-    offset = size * 0.1  # 两个圆弧的偏移
-
-    def arc_arrow(cx_, cy_, start, end, flip=False):
-        """绘制一段弧线并在末端加箭头。"""
-        bb = [cx_ - r, cy_ - r, cx_ + r, cy_ + r]
-        draw.arc(bb, start=start, end=end, fill=color, width=lw)
-        # 箭头头部（简单三角）
-        tip_angle = math.radians(end)
-        tip_x = cx_ + r * math.cos(tip_angle)
-        tip_y = cy_ + r * math.sin(tip_angle)
-        perp = math.radians(end + (90 if not flip else -90))
-        hw = lw * 1.8
-        ax = tip_x + hw * math.cos(perp)
-        ay = tip_y + hw * math.sin(perp)
-        bx = tip_x - hw * math.cos(perp)
-        by = tip_y - hw * math.sin(perp)
-        fwd = math.radians(end + (0 if not flip else 180))
-        fx = tip_x + hw * 1.5 * math.cos(fwd)
-        fy = tip_y + hw * 1.5 * math.sin(fwd)
-        draw.polygon([(ax, ay), (bx, by), (fx, fy)], fill=color)
-
-    arc_arrow(cx - offset * 0.3, cy - offset * 0.3, start=200, end=340, flip=False)
-    arc_arrow(cx + offset * 0.3, cy + offset * 0.3, start=20, end=160, flip=True)
-
-
-def _draw_alive(draw: ImageDraw.Draw, size: int, color: str) -> None:
-    """绘制简化心跳线（ECG 波形）。"""
-    lw = max(1, size // 10)
-    y_base = size * 0.55
-    points = [
-        (size * 0.08, y_base),
-        (size * 0.30, y_base),
-        (size * 0.38, y_base - size * 0.32),
-        (size * 0.46, y_base + size * 0.20),
-        (size * 0.54, y_base - size * 0.14),
-        (size * 0.62, y_base),
-        (size * 0.92, y_base),
-    ]
-    draw.line(points, fill=color, width=lw, joint='curve')
-
-
-_DRAW_FN = {
-    'default':   _draw_wifi,
-    'wifi':      _draw_wifi,
-    'ethernet':  _draw_ethernet,
-    'switching': _draw_switching,
-    'alive':     _draw_alive,
-}
-
-
-def generate_icon(name: str) -> None:
-    bg, fg = COLORS[name]
+def generate_icon(name: str, svg_text: str) -> None:
+    """合成图标并保存为多尺寸 ICO。"""
+    bg_color = COLORS[name]
     frames = []
+
     for sz in SIZES:
-        img, draw = _make_base(sz, bg)
-        _DRAW_FN[name](draw, sz, fg)
-        frames.append(img)
+        # 背景（圆角矩形）
+        bg = _make_rounded_bg(sz, bg_color)
+
+        # 图标区域留 15% 内边距
+        padding = max(1, int(sz * 0.15))
+        icon_area = sz - 2 * padding
+
+        # 渲染图标
+        icon_img = _svg_to_pil(svg_text, icon_area)
+        icon_img = icon_img.resize((icon_area, icon_area), Image.LANCZOS)
+
+        # 将图标（透明背景）贴到背景上
+        bg.paste(icon_img, (padding, padding), icon_img)
+        frames.append(bg)
 
     os.makedirs(ASSETS_DIR, exist_ok=True)
     out_path = os.path.join(ASSETS_DIR, f'icon_{name}.ico')
-    # 以最大尺寸为主，其余作为额外尺寸
-    frames[0].save(
+    # 以最大帧（256x256）为基础，Pillow 会自动缩小到各目标尺寸
+    frames[-1].save(
         out_path,
         format='ICO',
         sizes=[(s, s) for s in SIZES],
-        append_images=frames[1:],
     )
-    print(f'  生成: {out_path}')
+    print(f'  ✓ {out_path}')
 
 
 def main() -> None:
-    print('正在生成图标...')
-    for name in COLORS:
-        generate_icon(name)
-    print('✓ 所有图标生成完毕 →', ASSETS_DIR)
+    if not _SVG_AVAILABLE:
+        print('错误：缺少依赖，请先运行：pip install svglib reportlab')
+        return
+
+    print('正在从 Iconify（Fluent UI System Icons，MIT）下载图标...')
+    svg_cache: dict[str, str] = {}
+    for name, icon_id in ICON_SOURCES.items():
+        print(f'  下载 {icon_id} ...', end=' ', flush=True)
+        try:
+            svg_cache[name] = _fetch_svg(icon_id)
+            print('完成')
+        except Exception as exc:
+            print(f'失败 ({exc})')
+            return
+
+    print('正在生成 ICO 文件...')
+    for name in ICON_SOURCES:
+        generate_icon(name, svg_cache[name])
+
+    print(f'\n全部完成 → {ASSETS_DIR}')
 
 
 if __name__ == '__main__':

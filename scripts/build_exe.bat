@@ -12,15 +12,13 @@ if not exist "main.py" (
     exit /b 1
 )
 
-:: 生成图标 (如果 assets/ 中不存在)
-if not exist "assets\icon_default.ico" (
-    echo [提示] 正在生成图标...
-    python scripts\gen_icons.py
-    if errorlevel 1 (
-        echo [错误] 图标生成失败，请检查 Pillow 是否已安装
-        pause
-        exit /b 1
-    )
+:: 每次打包前重新生成图标（确保使用最新高清版本）
+echo [提示] 正在生成高清图标...
+python scripts\gen_icons.py
+if errorlevel 1 (
+    echo [错误] 图标生成失败，请检查依赖是否已安装: pip install svglib reportlab
+    pause
+    exit /b 1
 )
 
 :: 运行 PyInstaller

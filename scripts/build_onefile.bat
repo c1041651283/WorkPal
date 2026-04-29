@@ -11,14 +11,12 @@ if not exist "main.py" (
     exit /b 1
 )
 
-if not exist "assets\icon_default.ico" (
-    echo [提示] 正在生成图标...
-    python scripts\gen_icons.py
-    if errorlevel 1 (
-        echo [错误] 图标生成失败
-        pause
-        exit /b 1
-    )
+echo [提示] 正在生成高清图标...
+python scripts\gen_icons.py
+if errorlevel 1 (
+    echo [错误] 图标生成失败，请检查依赖是否已安装: pip install svglib reportlab
+    pause
+    exit /b 1
 )
 
 echo [提示] 开始打包 (单文件模式)...

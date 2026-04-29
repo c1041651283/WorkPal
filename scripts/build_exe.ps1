@@ -14,14 +14,12 @@ if (-not (Test-Path 'main.py')) {
     exit 1
 }
 
-# 生成图标 (如果 assets/ 中不存在)
-if (-not (Test-Path 'assets\icon_default.ico')) {
-    Write-Host '[提示] 正在生成图标...' -ForegroundColor Yellow
-    python scripts\gen_icons.py
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host '[错误] 图标生成失败，请检查 Pillow 是否已安装' -ForegroundColor Red
-        exit 1
-    }
+# 每次打包前重新生成图标（确保使用最新高清版本）
+Write-Host '[提示] 正在生成高清图标...' -ForegroundColor Yellow
+python scripts\gen_icons.py
+if ($LASTEXITCODE -ne 0) {
+    Write-Host '[错误] 图标生成失败，请检查依赖是否已安装: pip install svglib reportlab' -ForegroundColor Red
+    exit 1
 }
 
 # 运行 PyInstaller

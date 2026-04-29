@@ -13,6 +13,9 @@ import os
 import locale
 import time
 
+import threading
+
+import pythoncom
 import wmi as _wmi_module
 import psutil
 
@@ -20,15 +23,15 @@ from workpal.config import CONFIG
 
 logger = logging.getLogger(__name__)
 
-# WMI 连接实例（懒加载）
-_wmi_conn = None
+# 线程本地 WMI 连接（每个线程独立初始化，避免 CoInitialize 错误）
+_thread_local = threading.local()
 
 
 def _get_wmi():
-    global _wmi_conn
-    if _wmi_conn is None:
-        _wmi_conn = _wmi_module.WMI()
-    return _wmi_conn
+    if not getattr(_thread_local, 'wmi_conn', None):
+        pythoncom.CoInitialize()
+        _thread_local.wmi_conn = _wmi_module.WMI()
+    return _thread_local.wmi_conn
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +49,7 @@ def _run_netsh(args: list) -> tuple:
             ['netsh'] + args,
             shell=False,
             capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         try:
             stdout = result.stdout.decode(sys_encoding, errors='ignore')
@@ -317,7 +321,7 @@ def start_program(program_path: str) -> bool:
         return False
     try:
         logger.info(f"启动程序: {program_path}")
-        subprocess.Popen([program_path], shell=False)
+        subprocess.Popen([program_path], shell=False, creationflags=subprocess.CREATE_NO_WINDOW)
         return True
     except Exception as e:
         logger.error(f"启动程序失败: {e}")

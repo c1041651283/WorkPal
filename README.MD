@@ -77,7 +77,7 @@ WorkPal/
 │       ├── network.py           # 网络切换逻辑（wmi + psutil）
 │       └── keep_alive.py        # 保持在线功能
 ├── scripts/                     # 工具脚本
-│   ├── gen_icons.py             # 图标生成（Pillow 绘制，无版权风险）
+    ├── gen_icons.py             # 图标生成（Fluent UI Icons，MIT，需联网下载）
 │   ├── build_exe.bat/.ps1       # 文件夹模式打包
 │   ├── build_onefile.bat/.ps1   # 单文件模式打包
 │   ├── enable_autostart.ps1     # 启用开机自启
@@ -90,15 +90,16 @@ WorkPal/
 
 ## 图标说明
 
-图标在首次运行构建脚本时自动生成（`scripts/gen_icons.py`），无需手动准备：
+图标在首次运行构建脚本时自动生成（`scripts/gen_icons.py`），无需手动准备。
+图标来源：[Fluent UI System Icons](https://github.com/microsoft/fluentui-system-icons)（Microsoft，MIT 协议），每次打包时自动从网络下载最新版本。
 
 | 颜色/图案 | 含义 |
 |-----------|------|
-| 深灰 WiFi 图标 | 默认/空闲 |
+| 深灰 WiFi-off 图标 | 默认/空闲 |
 | 蓝色 WiFi 图标 | 当前使用 WiFi |
-| 绿色 网口图标 | 当前使用有线网络 |
-| 橙色 旋转箭头 | 正在切换网络 |
-| 紫色 心跳线 | 保持在线激活中 |
+| 绿色 插头图标 | 当前使用有线网络 |
+| 橙色 同步箭头 | 正在切换网络 |
+| 紫色 心跳波形 | 保持在线激活中 |
 
 ## 运行测试
 
