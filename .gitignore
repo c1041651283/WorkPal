@@ -1,5 +1,6 @@
 # 敏感配置文件（含 WiFi 密码等）
-network_config.ini
+network_config*.ini*
+!network_config.ini.example
 
 # 运行时日志
 *.log
@@ -9,13 +10,16 @@ network_config.ini
 .trae/
 .vscode/
 
+# OA 申请截图与状态（含敏感信息，不提交）
+oa_screenshots/
+oa_state.json
+
 # 生成的图标（由 scripts/gen_icons.py 生成，不提交二进制）
 assets/icon_*.ico
 
 # PyInstaller 构建产物
 dist/
 build/
-*.spec
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -49,7 +53,6 @@ MANIFEST
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
-*.spec
 
 # Installer logs
 pip-log.txt

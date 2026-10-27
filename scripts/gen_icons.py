@@ -152,10 +152,10 @@ def generate_icon(name: str, svg_text: str) -> None:
     print(f'  ✓ {out_path}')
 
 
-def main() -> None:
+def main() -> int:
     if not _SVG_AVAILABLE:
         print('错误：缺少依赖，请先运行：pip install svglib reportlab')
-        return
+        return 1
 
     print('正在从 Iconify（Fluent UI System Icons，MIT）下载图标...')
     svg_cache: dict[str, str] = {}
@@ -166,14 +166,15 @@ def main() -> None:
             print('完成')
         except Exception as exc:
             print(f'失败 ({exc})')
-            return
+            return 1
 
     print('正在生成 ICO 文件...')
     for name in ICON_SOURCES:
         generate_icon(name, svg_cache[name])
 
     print(f'\n全部完成 → {ASSETS_DIR}')
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
