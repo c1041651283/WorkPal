@@ -15,7 +15,6 @@ SendInput 是重置该计时器的 Windows 保证手段。
 
 import ctypes
 import ctypes.wintypes
-import platform
 import threading
 import logging
 
@@ -78,9 +77,7 @@ class _INPUT(ctypes.Structure):
 # ---------- 核心工具函数 ----------
 
 def _get_idle_seconds() -> float:
-    """返回 Windows 系统自上次用户输入起经过的秒数。非 Windows 返回 0。"""
-    if platform.system() != "Windows":
-        return 0.0
+    """返回 Windows 系统自上次用户输入起经过的秒数；查询失败返回 0。"""
     try:
         lii = _LASTINPUTINFO()
         lii.cbSize = ctypes.sizeof(_LASTINPUTINFO)
@@ -97,8 +94,6 @@ def _get_idle_seconds() -> float:
 
 def _simulate_f15_key() -> None:
     """通过 SendInput 模拟 F15 键按下/释放，重置 Windows 空闲计时器。"""
-    if platform.system() != "Windows":
-        return
     try:
         key_down = _INPUT()
         key_down.type = _INPUT_KEYBOARD
@@ -120,9 +115,7 @@ def _simulate_f15_key() -> None:
 
 
 def _set_execution_state(prevent_sleep: bool) -> None:
-    """调用 Windows API 阻止或恢复系统息屏与睡眠。非 Windows 平台静默忽略。"""
-    if platform.system() != "Windows":
-        return
+    """调用 Windows API 阻止或恢复系统息屏与睡眠。"""
     try:
         if prevent_sleep:
             ctypes.windll.kernel32.SetThreadExecutionState(
