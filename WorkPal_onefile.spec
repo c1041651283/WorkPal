@@ -1,8 +1,13 @@
 # WorkPal_onefile.spec — 单文件模式打包（便于分发）
-# 用法: pyinstaller WorkPal_onefile.spec
+# 用法: scripts\build_onefile.bat（或 pyinstaller WorkPal_onefile.spec）
 # 注意: 单文件模式启动较慢（需解压临时目录），但只有一个 exe 文件
+# network_config.ini.example 由 scripts\build_package.ps1 复制到 exe 旁，不打进包内。
 
-block_cipher = None
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(SPECPATH) / 'scripts'))
+from version_resource import version_info
 
 a = Analysis(
     ['main.py'],
@@ -10,7 +15,6 @@ a = Analysis(
     binaries=[],
     datas=[
         ('assets/icon_*.ico', 'assets'),
-        ('network_config.ini.example', '.'),
     ],
     hiddenimports=[
         'wmi',
@@ -25,27 +29,23 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
     noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure, a.zipped_data)
 
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
-    a.zipfiles,
     a.datas,
     [],
     name='WorkPal',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=[],
+    # UPX 压缩容易被公司杀毒软件误报，且启动更慢
+    upx=False,
     runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
@@ -54,5 +54,6 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='assets/icon_default.ico',
+    version=version_info(SPECPATH),
     uac_admin=True,
 )
