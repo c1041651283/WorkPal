@@ -4,7 +4,8 @@ workpal/features/network.py
 
 网卡启用/禁用/状态查询：使用 wmi（替代 netsh interface set/show）
 进程管理：使用 psutil（替代 tasklist/taskkill）
-WiFi 连接/断开：保留 netsh wlan（无等价纯 Python API）
+WiFi 状态与已保存配置：Native WiFi API（workpal.features.wlan）
+WiFi 连接/断开：netsh wlan，只使用 Windows 已保存的配置，不写入密码
 """
 
 import subprocess
@@ -12,13 +13,9 @@ import logging
 import os
 import locale
 import time
-import tempfile
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from functools import wraps
-from xml.etree import ElementTree
-from xml.sax.saxutils import escape as _xml_escape
 
 import threading
 
@@ -27,6 +24,7 @@ import wmi as _wmi_module
 import psutil
 
 from workpal.config import CONFIG
+from workpal.features import wlan
 from workpal.features.network_guard import network_change_lock
 
 logger = logging.getLogger(__name__)
@@ -173,31 +171,7 @@ def enable_adapter(adapter_name: str) -> bool:
 def get_wifi_connection_info(adapter_name: str) -> dict:
     """只匹配指定接口，保存实际连接的配置名和 SSID，供失败回滚使用。"""
     try:
-        success, output = _run_netsh(['wlan', 'show', 'interfaces'])
-        if not success or not output:
-            return {'state': 'unknown'}
-        interfaces = {}
-        current = None
-        for line in output.splitlines():
-            if ':' not in line:
-                continue
-            key, _, value = line.strip().partition(':')
-            key = key.strip().lower()
-            value = value.strip()
-            if key in ('name', '名称', 'interface name', '接口名称'):
-                current = interfaces.setdefault(value, {})
-            elif current is not None:
-                field = {'state': 'state', '状态': 'state', 'profile': 'profile',
-                         '配置文件': 'profile', 'ssid': 'ssid'}.get(key)
-                if field:
-                    current[field] = value
-        info = interfaces.get(adapter_name, {})
-        state = info.get('state', '').lower()
-        info['state'] = ('connected' if state in ('connected', '已连接') else
-                         'disconnected' if state in ('disconnected', 'not connected',
-                             '已断开连接', '已断开', '未连接', 'not ready', '不可用', '已禁用')
-                         else 'unknown')
-        return info
+        return wlan.interface_status(adapter_name)
     except Exception as e:
         logger.error(f"获取 WiFi 连接状态失败: {e}")
         return {'state': 'unknown'}
@@ -223,57 +197,17 @@ def get_current_mode() -> str:
     return 'unknown'
 
 
-def connect_wifi(ssid: str, password: str, *, profile_name: str | None = None) -> bool:
-    """通过 netsh wlan 临时配置文件连接 WiFi。"""
-    logger.info(f"连接 WiFi: {ssid}")
-    safe_ssid = _xml_escape(ssid)
-    safe_password = _xml_escape(password)
-    profile_name = profile_name or ssid
-    safe_profile = _xml_escape(profile_name)
-    profile_xml = (
-        '<?xml version="1.0"?>'
-        '<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1">'
-        f'<name>{safe_profile}</name>'
-        '<SSIDConfig><SSID>'
-        f'<name>{safe_ssid}</name>'
-        '</SSID></SSIDConfig>'
-        '<connectionType>ESS</connectionType>'
-        '<connectionMode>auto</connectionMode>'
-        '<MSM><security><authEncryption>'
-        '<authentication>WPA2PSK</authentication>'
-        '<encryption>AES</encryption>'
-        '<useOneX>false</useOneX>'
-        '</authEncryption><sharedKey>'
-        '<keyType>passPhrase</keyType>'
-        '<protected>false</protected>'
-        f'<keyMaterial>{safe_password}</keyMaterial>'
-        '</sharedKey></security></MSM>'
-        '</WLANProfile>'
-    )
-    # 使用随机文件名避免路径冲突，写入后尽快删除（netsh add profile 会内部缓存）
-    fd, profile_path = tempfile.mkstemp(suffix='.xml', prefix='workpal_wifi_')
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.write(profile_xml)
-        add_ok, _ = _run_netsh(['wlan', 'add', 'profile', f'filename={profile_path}',
-                               f"interface={CONFIG['wifi_adapter_name']}"])
-        # 立即删除临时文件，WiFi 密码不应残留于磁盘
-        os.remove(profile_path)
-        if not add_ok:
-            logger.error("添加 WiFi 配置文件失败")
-            return False
-        success, _ = _run_netsh(['wlan', 'connect', f'name={profile_name}', f'ssid={ssid}',
-                               f"interface={CONFIG['wifi_adapter_name']}"])
-        return success
-    except Exception as e:
-        logger.error(f"连接 WiFi 失败: {e}")
-        return False
-    finally:
-        if os.path.exists(profile_path):
-            try:
-                os.remove(profile_path)
-            except OSError as e:
-                logger.warning(f"清理临时 WiFi 配置文件失败: {e}")
+def find_saved_profile(adapter_name: str, ssid: str) -> str | None:
+    """返回 Windows 已保存的、连接该 SSID 的配置名；网卡禁用等无法查询时抛出异常。"""
+    return wlan.find_profile(adapter_name, ssid)
+
+
+def connect_wifi(profile: str, ssid: str, adapter_name: str) -> bool:
+    """使用 Windows 已保存的配置连接 WiFi，WorkPal 不保存也不写入密码。"""
+    logger.info(f"连接 WiFi: {ssid}（配置 {profile}）")
+    success, _ = _run_netsh(['wlan', 'connect', f'name={profile}', f'ssid={ssid}',
+                             f'interface={adapter_name}'])
+    return success
 
 
 def disconnect_wifi(adapter_name: str) -> bool:
@@ -444,31 +378,7 @@ def _capture_network_state() -> NetworkSnapshot:
                            info['state'], info.get('profile', ''), info.get('ssid', ''))
 
 
-def _backup_wifi_profile(profile_name: str, adapter: str) -> bytes | None:
-    # 不导出明文密钥；仅保留将被改写的 WorkPal 专用配置，其余配置不动。
-    with tempfile.TemporaryDirectory(prefix='workpal_profiles_') as folder:
-        ok, _ = _run_netsh(['wlan', 'export', 'profile', f'interface={adapter}', f'folder={folder}'])
-        if not ok:
-            raise RuntimeError('备份 WiFi 配置失败，未开始切换')
-        for path in Path(folder).glob('*.xml'):
-            data = path.read_bytes()
-            root = ElementTree.fromstring(data)
-            if root.findtext('{http://www.microsoft.com/networking/WLAN/profile/v1}name') == profile_name:
-                return data
-    return None
-
-
-def _restore_wifi_profile(profile_name: str, data: bytes | None, adapter: str) -> bool:
-    if data is None:
-        # profile_name 由哈希生成，绝不把用户 SSID 当作删除通配符。
-        return _run_netsh(['wlan', 'delete', 'profile', f'name={profile_name}', f'interface={adapter}'])[0]
-    with tempfile.TemporaryDirectory(prefix='workpal_restore_') as folder:
-        path = Path(folder) / 'profile.xml'
-        path.write_bytes(data)
-        return _run_netsh(['wlan', 'add', 'profile', f'filename={path}', f'interface={adapter}'])[0]
-
-
-def _restore_network(snapshot: NetworkSnapshot, profile_name: str = '', profile_data: bytes | None = None) -> list[str]:
+def _restore_network(snapshot: NetworkSnapshot, attempted_wifi: bool = False) -> list[str]:
     errors = []
 
     def attempt(label, operation):
@@ -479,13 +389,11 @@ def _restore_network(snapshot: NetworkSnapshot, profile_name: str = '', profile_
             logger.exception('网络回滚失败：%s', label)
             errors.append(label)
 
-    # 先撤销新连接/新配置，再恢复原网卡，避免错误配置自动重连。
-    if profile_name or snapshot.wifi_state == 'disconnected':
+    # 先撤销新连接，再恢复原网卡；WorkPal 不修改任何已保存的 WiFi 配置。
+    if attempted_wifi or snapshot.wifi_state == 'disconnected':
         if get_adapter_status(snapshot.wifi_name) != 'disabled':
             attempt('断开新 WiFi 连接', lambda: disconnect_wifi(snapshot.wifi_name)
                     and wait_for_wifi_disconnected(snapshot.wifi_name))
-    if profile_name:
-        attempt('恢复 WiFi 配置', lambda: _restore_wifi_profile(profile_name, profile_data, snapshot.wifi_name))
     for name, state in ((snapshot.ethernet_name, snapshot.ethernet_adapter),
                         (snapshot.wifi_name, snapshot.wifi_adapter)):
         if state == 'disabled':
@@ -506,14 +414,19 @@ def _switch_network(target: str) -> tuple:
     from workpal.features.vpn_proxy import assistant
     if assistant.active:
         return False, 'FortiClient 代理助手正在运行，为保护 VPN 连接，未切换网卡；请先停止助手'
-    profile_name, profile_data, changed_profile = '', None, False
+    ssid = CONFIG['wifi_ssid']
+    missing_profile = f'Windows 中没有 WiFi「{ssid}」的已保存配置，请先手动连接一次'
+    profile, attempted_wifi = None, False
     try:
         snapshot = _capture_network_state()
         if target == 'wifi':
-            if not CONFIG['wifi_ssid'] or not CONFIG['wifi_password']:
-                raise RuntimeError('WiFi 名称或密码未配置，未开始切换')
-            profile_name = 'WorkPal-' + hashlib.sha256(CONFIG['wifi_ssid'].encode('utf-8')).hexdigest()[:24]
-            profile_data = _backup_wifi_profile(profile_name, snapshot.wifi_name)
+            if not ssid:
+                raise RuntimeError('WiFi 名称未配置，未开始切换')
+            # 网卡已禁用时无法列出配置，启用网卡后再查，失败照常回滚。
+            if snapshot.wifi_adapter != 'disabled':
+                profile = find_saved_profile(snapshot.wifi_name, ssid)
+                if not profile:
+                    raise RuntimeError(missing_profile + '；未开始切换')
     except Exception as exc:
         return False, str(exc)
 
@@ -523,14 +436,15 @@ def _switch_network(target: str) -> tuple:
 
     try:
         if target == 'wifi':
-            require(disable_adapter(snapshot.ethernet_name), '无法禁用有线网卡')
-            require(wait_for_adapter_disabled(snapshot.ethernet_name, timeout=5), '有线网卡禁用超时')
             require(enable_adapter(snapshot.wifi_name), '无法启用 WiFi 网卡')
             require(wait_for_adapter_enabled(snapshot.wifi_name, timeout=5), 'WiFi 网卡启用超时')
-            changed_profile = True
-            require(connect_wifi(CONFIG['wifi_ssid'], CONFIG['wifi_password'], profile_name=profile_name),
-                    'WiFi 连接命令执行失败')
-            require(wait_for_wifi_connected(snapshot.wifi_name, profile=profile_name, ssid=CONFIG['wifi_ssid']),
+            profile = profile or find_saved_profile(snapshot.wifi_name, ssid)
+            require(profile, missing_profile)
+            require(disable_adapter(snapshot.ethernet_name), '无法禁用有线网卡')
+            require(wait_for_adapter_disabled(snapshot.ethernet_name, timeout=5), '有线网卡禁用超时')
+            attempted_wifi = True
+            require(connect_wifi(profile, ssid, snapshot.wifi_name), 'WiFi 连接命令执行失败')
+            require(wait_for_wifi_connected(snapshot.wifi_name, profile=profile, ssid=ssid),
                     '目标 WiFi 连接超时 (15s)')
         else:
             if snapshot.wifi_adapter != 'disabled':
@@ -552,7 +466,7 @@ def _switch_network(target: str) -> tuple:
     except Exception as exc:
         logger.exception('网络切换失败，开始恢复原连接')
         try:
-            errors = _restore_network(snapshot, profile_name if changed_profile else '', profile_data)
+            errors = _restore_network(snapshot, attempted_wifi)
         except Exception:
             logger.exception('恢复原连接异常')
             errors = ['无法确认恢复结果']

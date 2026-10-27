@@ -9,10 +9,8 @@ WIFI_ADAPTER_NAME=WLAN
 ETHERNET_ADAPTER_NAME=以太网
 
 # WiFi名称（SSID）- 运行下方命令查看可用WiFi: netsh wlan show networks
+# 需要先在 Windows 中手动连接一次并保存密码；WorkPal 使用已保存的配置，不需要也不保存密码
 WIFI_SSID=your_wifi_ssid
-
-# WiFi密码
-WIFI_PASSWORD=your_wifi_password
 
 # 切换到有线时启动的程序路径（可选，如不需要可留空）
 ETHERNET_PROGRAM_PATH=
@@ -31,6 +29,6 @@ PROXY_CHECK_INTERVAL=60
 # 使用说明：
 # 1. 首先在Windows命令行中运行 "netsh interface show interface" 查看你的网卡名称
 # 2. 将上面的网卡名称填入 WIFI_ADAPTER_NAME 和 ETHERNET_ADAPTER_NAME
-# 3. 填入你的WiFi名称和密码
+# 3. 填入你的WiFi名称，并确认 Windows 已保存该 WiFi（连接过一次即可）
 # 4. 如果切换到有线时需要启动某个程序，请填入完整路径
 # 5. 需要以管理员权限运行程序才能切换网卡

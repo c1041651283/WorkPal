@@ -24,7 +24,6 @@ class TestLoadConfig(unittest.TestCase):
             'wifi_adapter_name': 'WLAN',
             'ethernet_adapter_name': '以太网',
             'wifi_ssid': '',
-            'wifi_password': '',
             'ethernet_program_path': '',
         })
 
@@ -51,12 +50,17 @@ class TestLoadConfig(unittest.TestCase):
             f.write(content)
             tmp = f.name
         try:
-            self._cfg.load_config(config_file=tmp)
+            with self.assertLogs('workpal.config', level='WARNING') as logs:
+                self._cfg.load_config(config_file=tmp)
             self.assertEqual(self._cfg.CONFIG['wifi_adapter_name'], 'WiFi')
             self.assertEqual(self._cfg.CONFIG['ethernet_adapter_name'], 'Ethernet')
             self.assertEqual(self._cfg.CONFIG['wifi_ssid'], 'TestNet')
-            self.assertEqual(self._cfg.CONFIG['wifi_password'], 'secret123')
             self.assertEqual(self._cfg.CONFIG['ethernet_program_path'], 'C:\\test\\app.exe')
+            # 旧的明文密码不再读入内存，只提示用户删除。
+            self.assertNotIn('wifi_password', self._cfg.CONFIG)
+            self.assertNotIn('secret123', str(self._cfg.CONFIG))
+            self.assertTrue(any('WIFI_PASSWORD' in line and 'secret123' not in line
+                                for line in logs.output))
         finally:
             os.unlink(tmp)
 
@@ -189,84 +193,22 @@ class TestProcessManagement(unittest.TestCase):
 
 
 class TestConnectWifi(unittest.TestCase):
-    """connect_wifi() 测试 —— XML 转义、错误处理、临时文件清理。"""
+    """connect_wifi() 只使用已保存的配置，不写入密码或临时文件。"""
 
-    @patch('workpal.features.network.os.remove')
-    @patch('workpal.features.network.os.fdopen')
-    @patch('workpal.features.network.tempfile.mkstemp')
-    @patch('workpal.features.network._run_netsh')
-    def test_xml_escaping_special_characters(self, mock_netsh, mock_mkstemp,
-                                              _mock_fdopen, _mock_remove):
-        """SSID 含 XML 特殊字符时正确转义，避免 XML 损坏。"""
+    @patch('workpal.features.network._run_netsh', return_value=(True, ''))
+    def test_connects_with_saved_profile_only(self, mock_netsh):
         from workpal.features import network
-        fd_mock = MagicMock()
-        mock_mkstemp.return_value = (fd_mock, r'C:\Temp\test.xml')
-        mock_netsh.side_effect = [(True, ''), (True, '')]
+        self.assertTrue(network.connect_wifi('Home "5G"', 'Home<Net>&', 'WLAN'))
+        args = mock_netsh.call_args.args[0]
+        self.assertEqual(args, ['wlan', 'connect', 'name=Home "5G"', 'ssid=Home<Net>&',
+                                'interface=WLAN'])
+        self.assertFalse(any('profile' == arg or arg.startswith('filename=') or 'key' in arg
+                             for arg in args))
 
-        network.connect_wifi('Test<Net>&"WiFi\'', 'p@ss<word>&')
-
-        # 确认传给 netsh 的 XML 已被转义
-        call_args = mock_netsh.call_args_list
-        self.assertEqual(call_args[0][0][0], ['wlan', 'add', 'profile',
-                          'filename=C:\\Temp\\test.xml', f"interface={network.CONFIG['wifi_adapter_name']}"])
-        self.assertEqual(call_args[1][0][0], ['wlan', 'connect',
-                          "name=Test<Net>&\"WiFi'", "ssid=Test<Net>&\"WiFi'",
-                          f"interface={network.CONFIG['wifi_adapter_name']}"])
-        from xml.etree import ElementTree
-        xml = _mock_fdopen.return_value.__enter__.return_value.write.call_args.args[0]
-        root = ElementTree.fromstring(xml)
-        ns = {'w': 'http://www.microsoft.com/networking/WLAN/profile/v1'}
-        self.assertEqual(root.findtext('w:SSIDConfig/w:SSID/w:name', namespaces=ns), 'Test<Net>&"WiFi\'')
-        self.assertEqual(root.findtext('w:MSM/w:security/w:sharedKey/w:keyMaterial', namespaces=ns), 'p@ss<word>&')
-
-    @patch('workpal.features.network.os.remove')
-    @patch('workpal.features.network.os.fdopen')
-    @patch('workpal.features.network.tempfile.mkstemp')
-    @patch('workpal.features.network._run_netsh')
-    def test_normal_ssid_no_escaping_needed(self, mock_netsh, mock_mkstemp,
-                                             _mock_fdopen, _mock_remove):
-        """正常 SSID/密码不受转义影响。"""
+    @patch('workpal.features.network._run_netsh', return_value=(False, 'error'))
+    def test_connect_failure_returns_false(self, _mock_netsh):
         from workpal.features import network
-        fd_mock = MagicMock()
-        mock_mkstemp.return_value = (fd_mock, r'C:\Temp\test.xml')
-        mock_netsh.side_effect = [(True, ''), (True, '')]
-
-        result = network.connect_wifi('MyWiFi', 'simplepass')
-        self.assertTrue(result)
-
-    @patch('workpal.features.network.os.remove')
-    @patch('workpal.features.network.os.fdopen')
-    @patch('workpal.features.network.tempfile.mkstemp')
-    @patch('workpal.features.network._run_netsh')
-    def test_add_profile_failure_returns_false(self, mock_netsh, mock_mkstemp,
-                                                _mock_fdopen, _mock_remove):
-        """add profile 失败时应返回 False，不尝试 connect。"""
-        from workpal.features import network
-        fd_mock = MagicMock()
-        mock_mkstemp.return_value = (fd_mock, r'C:\Temp\test.xml')
-        mock_netsh.side_effect = [(False, 'error')]  # add profile 失败
-
-        result = network.connect_wifi('MyWiFi', 'pass')
-        self.assertFalse(result)
-        # 确认只调用了 add profile，没有调 connect
-        self.assertEqual(len(mock_netsh.call_args_list), 1)
-
-    @patch('workpal.features.network.os.path.exists', return_value=True)
-    @patch('workpal.features.network.os.remove')
-    @patch('workpal.features.network.os.fdopen')
-    @patch('workpal.features.network.tempfile.mkstemp')
-    @patch('workpal.features.network._run_netsh')
-    def test_temp_file_cleaned_up_on_error(self, mock_netsh, mock_mkstemp,
-                                            _mock_fdopen, mock_remove, _mock_exists):
-        """发生异常时 finally 块确保临时文件被清理。"""
-        from workpal.features import network
-        fd_mock = MagicMock()
-        mock_mkstemp.return_value = (fd_mock, r'C:\Temp\test.xml')
-        mock_netsh.side_effect = RuntimeError('boom')
-
-        result = network.connect_wifi('MyWiFi', 'pass')
-        self.assertFalse(result)
-        mock_remove.assert_called()
+        self.assertFalse(network.connect_wifi('Home', 'Home', 'WLAN'))
 
 
 if __name__ == '__main__':

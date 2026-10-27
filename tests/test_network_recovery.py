@@ -1,6 +1,5 @@
 """验证网络状态与恢复结果，不执行网卡、WLAN 或进程操作。"""
 
-from pathlib import Path
 import subprocess
 from unittest.mock import MagicMock
 
@@ -16,11 +15,10 @@ def machine(monkeypatch):
     monkeypatch.setitem(net.CONFIG, 'wifi_adapter_name', 'WiFi')
     monkeypatch.setitem(net.CONFIG, 'ethernet_adapter_name', 'LAN')
     monkeypatch.setitem(net.CONFIG, 'wifi_ssid', 'target')
-    monkeypatch.setitem(net.CONFIG, 'wifi_password', 'test-password')
     monkeypatch.setitem(net.CONFIG, 'ethernet_program_path', '')
     state = {'adapters': {'WiFi': 'enabled_disconnected', 'LAN': 'enabled_connected'},
              'wifi': {'state': 'disconnected'}, 'connect_ok': True, 'link_up': True,
-             'commands': [], 'saved_profile': b'<original/>', 'fail_enable': ''}
+             'commands': [], 'profiles': {'target': 'target-profile'}, 'fail_enable': ''}
 
     def enable(name):
         if state['fail_enable'] == name:
@@ -36,16 +34,16 @@ def machine(monkeypatch):
         state['wifi'] = {'state': 'disconnected'}
         return True
 
-    def connect(ssid, password, *, profile_name):
-        state['commands'].append(('new', ssid, profile_name))
-        state['saved_profile'] = b'<new/>'
+    def connect(profile, ssid, adapter):
+        state['commands'].append(('new', profile, ssid, adapter))
         if state['connect_ok']:
-            state['wifi'] = {'state': 'connected', 'profile': profile_name, 'ssid': ssid}
+            state['wifi'] = {'state': 'connected', 'profile': profile, 'ssid': ssid}
         return state['connect_ok']
 
-    def restore_profile(name, data, adapter):
-        state['saved_profile'] = data
-        return True
+    def find_profile(adapter, ssid):
+        if state['adapters'][adapter] == 'disabled':
+            raise LookupError('interface missing')
+        return state['profiles'].get(ssid)
 
     def netsh(args):
         state['commands'].append(args)
@@ -60,20 +58,19 @@ def machine(monkeypatch):
     monkeypatch.setattr(net, 'disable_adapter', disable)
     monkeypatch.setattr(net, 'disconnect_wifi', disconnect)
     monkeypatch.setattr(net, 'connect_wifi', connect)
-    monkeypatch.setattr(net, '_backup_wifi_profile', lambda *args: state['saved_profile'])
-    monkeypatch.setattr(net, '_restore_wifi_profile', restore_profile)
+    monkeypatch.setattr(net, 'find_saved_profile', find_profile)
     monkeypatch.setattr(net, '_run_netsh', netsh)
     monkeypatch.setattr(net, '_wait_for', lambda check, timeout, interval=1: check())
     return state
 
 
-def test_wifi_failure_restores_ethernet_and_previous_profile(machine):
+def test_wifi_failure_restores_ethernet_and_disconnects_wifi(machine):
     machine['connect_ok'] = False
     success, reason = net.switch_to_wifi()
     assert not success and '已恢复原网络状态' in reason
     assert machine['adapters']['LAN'] == 'enabled_connected'
     assert machine['wifi']['state'] == 'disconnected'
-    assert machine['saved_profile'] == b'<original/>'
+    assert machine['commands'] == [('new', 'target-profile', 'target', 'WiFi')]
 
 
 def test_missing_cable_restores_actual_wifi_profile_not_configured_ssid(machine):
@@ -122,11 +119,42 @@ def test_success_requires_target_connection(machine):
     assert machine['wifi']['ssid'] == 'target'
 
 
-def test_backup_failure_prevents_any_network_change(machine, monkeypatch):
-    monkeypatch.setattr(net, '_backup_wifi_profile', MagicMock(side_effect=OSError('backup failed')))
+def test_missing_saved_profile_prevents_any_network_change(machine):
+    machine['profiles'] = {}
     before = machine['adapters'].copy()
-    assert net.switch_to_wifi() == (False, 'backup failed')
+    success, reason = net.switch_to_wifi()
+    assert not success and '已保存配置' in reason and '未开始切换' in reason
     assert machine['adapters'] == before
+    assert machine['commands'] == []
+
+
+def test_profile_lookup_failure_prevents_any_network_change(machine, monkeypatch):
+    monkeypatch.setattr(net, 'find_saved_profile', MagicMock(side_effect=OSError('wlan service stopped')))
+    before = machine['adapters'].copy()
+    assert net.switch_to_wifi() == (False, 'wlan service stopped')
+    assert machine['adapters'] == before
+
+
+def test_profile_matched_by_ssid_is_used_for_connection(machine):
+    machine['profiles'] = {'target': 'Home 5G (saved)'}
+    assert net.switch_to_wifi() == (True, '')
+    assert machine['commands'] == [('new', 'Home 5G (saved)', 'target', 'WiFi')]
+    assert machine['wifi']['profile'] == 'Home 5G (saved)'
+
+
+def test_disabled_wifi_adapter_is_enabled_before_profile_lookup(machine):
+    machine['adapters']['WiFi'] = 'disabled'
+    assert net.switch_to_wifi() == (True, '')
+    assert machine['adapters'] == {'WiFi': 'enabled_disconnected', 'LAN': 'disabled'}
+
+
+def test_missing_profile_after_enabling_wifi_rolls_back(machine):
+    machine['adapters']['WiFi'] = 'disabled'
+    machine['profiles'] = {}
+    success, reason = net.switch_to_wifi()
+    assert not success and '已保存配置' in reason and '已恢复原网络状态' in reason
+    assert machine['adapters'] == {'WiFi': 'disabled', 'LAN': 'enabled_connected'}
+    assert machine['commands'] == []
 
 
 def test_unknown_is_not_disconnected(monkeypatch):
@@ -135,29 +163,18 @@ def test_unknown_is_not_disconnected(monkeypatch):
     assert not net.wait_for_wifi_disconnected('WiFi')
 
 
-@pytest.mark.parametrize('state,expected', [('not connected', 'disconnected'), ('connected', 'connected'), ('connecting', 'unknown')])
-def test_wifi_info_matches_exact_interface_and_preserves_profile(monkeypatch, state, expected):
-    output = f'Name : WiFi\nState : {state}\nSSID : actual\nProfile : saved\n\nName : Other\nState : connected\n'
-    monkeypatch.setattr(net, '_run_netsh', lambda args: (True, output))
-    assert net.get_wifi_connection_info('WiFi') == {'state': expected, 'ssid': 'actual', 'profile': 'saved'}
-    assert net.get_wifi_connection_status('Missing') == 'unknown'
+def test_wifi_info_comes_from_native_api_and_errors_are_unknown(monkeypatch):
+    info = {'state': 'connected', 'ssid': 'actual', 'profile': 'saved'}
+    monkeypatch.setattr(net.wlan, 'interface_status', lambda name: dict(info))
+    assert net.get_wifi_connection_info('WiFi') == info
+    monkeypatch.setattr(net.wlan, 'interface_status', MagicMock(side_effect=OSError('service stopped')))
+    assert net.get_wifi_connection_status('WiFi') == 'unknown'
 
 
 def test_unconnected_ethernet_is_not_current_mode(monkeypatch):
     monkeypatch.setattr(net, 'get_wifi_connection_status', lambda _: 'disconnected')
     monkeypatch.setattr(net, 'get_adapter_status', lambda _: 'enabled_disconnected')
     assert net.get_current_mode() == 'unknown'
-
-
-def test_profile_backup_never_exports_cleartext_password(monkeypatch):
-    data = b'<WLANProfile xmlns="http://www.microsoft.com/networking/WLAN/profile/v1"><name>WorkPal-safe</name></WLANProfile>'
-    def export(args):
-        assert 'key=clear' not in args
-        folder = Path(next(arg.split('=', 1)[1] for arg in args if arg.startswith('folder=')))
-        (folder / 'saved.xml').write_bytes(data)
-        return True, ''
-    monkeypatch.setattr(net, '_run_netsh', export)
-    assert net._backup_wifi_profile('WorkPal-safe', 'WiFi') == data
 
 
 def test_process_path_matching_and_graceful_close(monkeypatch):
