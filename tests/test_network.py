@@ -90,6 +90,40 @@ class TestLoadConfig(unittest.TestCase):
             os.unlink(tmp)
 
 
+class TestUserDataPath(unittest.TestCase):
+
+    def setUp(self):
+        from workpal import config as cfg
+        self._cfg = cfg
+
+    def test_uses_localappdata_workpal_directory(self):
+        from workpal.system import get_user_data_path
+
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.dict(os.environ, {'LOCALAPPDATA': tmp}):
+            path = get_user_data_path('app.log')
+
+        self.assertEqual(path, os.path.join(tmp, 'WorkPal', 'app.log'))
+
+    def test_removed_application_settings_are_ignored(self):
+        content = (
+            "OA_URL=http://oa.example.test\n"
+            "OA_USERNAME=legacy-user\n"
+            "OA_PASSWORD=legacy-secret\n"
+            "OA_AUTO_SCHEDULE=true\n"
+        )
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.ini', delete=False, encoding='utf-8'
+        ) as f:
+            f.write(content)
+            tmp = f.name
+        try:
+            self._cfg.load_config(config_file=tmp)
+            self.assertFalse(any(key.startswith('oa_') for key in self._cfg.CONFIG))
+        finally:
+            os.unlink(tmp)
+
+
 class TestGetCurrentMode(unittest.TestCase):
     """network.get_current_mode() 测试（mock WMI / netsh）。"""
 
@@ -126,6 +160,7 @@ class TestProcessManagement(unittest.TestCase):
         from workpal.features import network
         proc = MagicMock()
         proc.info = {'name': 'app.exe'}
+        proc.exe.return_value = r'C:\some\app.exe'
         mock_psutil.process_iter.return_value = [proc]
         mock_psutil.NoSuchProcess = Exception
         mock_psutil.AccessDenied = Exception
@@ -136,6 +171,7 @@ class TestProcessManagement(unittest.TestCase):
         from workpal.features import network
         proc = MagicMock()
         proc.info = {'name': 'other.exe'}
+        proc.exe.return_value = r'C:\some\other.exe'
         mock_psutil.process_iter.return_value = [proc]
         mock_psutil.NoSuchProcess = Exception
         mock_psutil.AccessDenied = Exception
@@ -150,6 +186,87 @@ class TestProcessManagement(unittest.TestCase):
     def test_kill_process_empty_path(self, _mock_psutil):
         from workpal.features import network
         self.assertTrue(network.kill_process(''))
+
+
+class TestConnectWifi(unittest.TestCase):
+    """connect_wifi() 测试 —— XML 转义、错误处理、临时文件清理。"""
+
+    @patch('workpal.features.network.os.remove')
+    @patch('workpal.features.network.os.fdopen')
+    @patch('workpal.features.network.tempfile.mkstemp')
+    @patch('workpal.features.network._run_netsh')
+    def test_xml_escaping_special_characters(self, mock_netsh, mock_mkstemp,
+                                              _mock_fdopen, _mock_remove):
+        """SSID 含 XML 特殊字符时正确转义，避免 XML 损坏。"""
+        from workpal.features import network
+        fd_mock = MagicMock()
+        mock_mkstemp.return_value = (fd_mock, r'C:\Temp\test.xml')
+        mock_netsh.side_effect = [(True, ''), (True, '')]
+
+        network.connect_wifi('Test<Net>&"WiFi\'', 'p@ss<word>&')
+
+        # 确认传给 netsh 的 XML 已被转义
+        call_args = mock_netsh.call_args_list
+        self.assertEqual(call_args[0][0][0], ['wlan', 'add', 'profile',
+                          'filename=C:\\Temp\\test.xml', f"interface={network.CONFIG['wifi_adapter_name']}"])
+        self.assertEqual(call_args[1][0][0], ['wlan', 'connect',
+                          "name=Test<Net>&\"WiFi'", "ssid=Test<Net>&\"WiFi'",
+                          f"interface={network.CONFIG['wifi_adapter_name']}"])
+        from xml.etree import ElementTree
+        xml = _mock_fdopen.return_value.__enter__.return_value.write.call_args.args[0]
+        root = ElementTree.fromstring(xml)
+        ns = {'w': 'http://www.microsoft.com/networking/WLAN/profile/v1'}
+        self.assertEqual(root.findtext('w:SSIDConfig/w:SSID/w:name', namespaces=ns), 'Test<Net>&"WiFi\'')
+        self.assertEqual(root.findtext('w:MSM/w:security/w:sharedKey/w:keyMaterial', namespaces=ns), 'p@ss<word>&')
+
+    @patch('workpal.features.network.os.remove')
+    @patch('workpal.features.network.os.fdopen')
+    @patch('workpal.features.network.tempfile.mkstemp')
+    @patch('workpal.features.network._run_netsh')
+    def test_normal_ssid_no_escaping_needed(self, mock_netsh, mock_mkstemp,
+                                             _mock_fdopen, _mock_remove):
+        """正常 SSID/密码不受转义影响。"""
+        from workpal.features import network
+        fd_mock = MagicMock()
+        mock_mkstemp.return_value = (fd_mock, r'C:\Temp\test.xml')
+        mock_netsh.side_effect = [(True, ''), (True, '')]
+
+        result = network.connect_wifi('MyWiFi', 'simplepass')
+        self.assertTrue(result)
+
+    @patch('workpal.features.network.os.remove')
+    @patch('workpal.features.network.os.fdopen')
+    @patch('workpal.features.network.tempfile.mkstemp')
+    @patch('workpal.features.network._run_netsh')
+    def test_add_profile_failure_returns_false(self, mock_netsh, mock_mkstemp,
+                                                _mock_fdopen, _mock_remove):
+        """add profile 失败时应返回 False，不尝试 connect。"""
+        from workpal.features import network
+        fd_mock = MagicMock()
+        mock_mkstemp.return_value = (fd_mock, r'C:\Temp\test.xml')
+        mock_netsh.side_effect = [(False, 'error')]  # add profile 失败
+
+        result = network.connect_wifi('MyWiFi', 'pass')
+        self.assertFalse(result)
+        # 确认只调用了 add profile，没有调 connect
+        self.assertEqual(len(mock_netsh.call_args_list), 1)
+
+    @patch('workpal.features.network.os.path.exists', return_value=True)
+    @patch('workpal.features.network.os.remove')
+    @patch('workpal.features.network.os.fdopen')
+    @patch('workpal.features.network.tempfile.mkstemp')
+    @patch('workpal.features.network._run_netsh')
+    def test_temp_file_cleaned_up_on_error(self, mock_netsh, mock_mkstemp,
+                                            _mock_fdopen, mock_remove, _mock_exists):
+        """发生异常时 finally 块确保临时文件被清理。"""
+        from workpal.features import network
+        fd_mock = MagicMock()
+        mock_mkstemp.return_value = (fd_mock, r'C:\Temp\test.xml')
+        mock_netsh.side_effect = RuntimeError('boom')
+
+        result = network.connect_wifi('MyWiFi', 'pass')
+        self.assertFalse(result)
+        mock_remove.assert_called()
 
 
 if __name__ == '__main__':

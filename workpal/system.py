@@ -1,5 +1,6 @@
 import sys
 import os
+from pathlib import Path
 
 
 def is_frozen() -> bool:
@@ -18,6 +19,16 @@ def get_resource_path(relative_path: str) -> str:
         # 项目根目录（workpal/ 的上一级）
         base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, relative_path)
+
+
+def get_user_data_path(relative_path: str = '') -> str:
+    """返回稳定的用户数据目录，不受当前工作目录或打包模式影响。"""
+    local_app_data = Path(
+        os.environ.get('LOCALAPPDATA', Path.home() / 'AppData' / 'Local')
+    )
+    base = local_app_data / 'WorkPal'
+    base.mkdir(parents=True, exist_ok=True)
+    return str(base / relative_path) if relative_path else str(base)
 
 
 def exit_app() -> None:

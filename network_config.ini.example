@@ -17,6 +17,17 @@ WIFI_PASSWORD=your_wifi_password
 # 切换到有线时启动的程序路径（可选，如不需要可留空）
 ETHERNET_PROGRAM_PATH=
 
+# 代理守护（公司/在家均需从托盘手动开启；不会自动连接或修改 VPN）
+# 留空时查找默认安装目录；仅允许指向 FortiClient.exe
+FORTICLIENT_PATH=
+VPN_PROXY_SERVER=proxy.ricoh.co.jp:8080
+
+# 启动 WorkPal 及“开启脚本代理”按钮使用的地址；同时关闭手动代理，守护需手动开启
+OFFICE_PAC_URL=http://proxy.psh.com.cn/proxy-psh1.pac
+
+# 代理守护检查间隔（秒，默认 60，最小 30；也可从托盘选择 1/2/5 分钟）
+PROXY_CHECK_INTERVAL=60
+
 # 使用说明：
 # 1. 首先在Windows命令行中运行 "netsh interface show interface" 查看你的网卡名称
 # 2. 将上面的网卡名称填入 WIFI_ADAPTER_NAME 和 ETHERNET_ADAPTER_NAME

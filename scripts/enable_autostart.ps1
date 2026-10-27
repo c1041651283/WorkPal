@@ -1,44 +1,69 @@
-# scripts/enable_autostart.ps1
+﻿# scripts/enable_autostart.ps1
 # 启用 WorkPal 开机自启动（使用 Windows 任务计划程序）
 # 注意: 需要管理员权限
 
 #Requires -RunAsAdministrator
 
+param(
+    [string]$ExePath = '',
+    [string]$Arguments = '',
+    [string]$WorkingDirectory = ''
+)
+
+$ErrorActionPreference = 'Stop'
 $TaskName = 'WorkPal_AutoStart'
-$ExePath  = Join-Path $PSScriptRoot '..\dist\WorkPal\WorkPal.exe' | Resolve-Path -ErrorAction SilentlyContinue
 
 if (-not $ExePath) {
-    $ExePath = Join-Path (Get-Location) 'dist\WorkPal\WorkPal.exe'
-    Write-Host "[警告] 未找到 dist\WorkPal\WorkPal.exe，将使用路径: $ExePath" -ForegroundColor Yellow
-    Write-Host '        请先运行 scripts\build_exe.bat 完成打包' -ForegroundColor Yellow
+    $ResolvedExePath = Join-Path $PSScriptRoot '..\dist\WorkPal\WorkPal.exe' | Resolve-Path -ErrorAction SilentlyContinue
+    if ($ResolvedExePath) {
+        $ExePath = [string]$ResolvedExePath
+    } else {
+        throw '请通过托盘启用自启动，或用 -ExePath 指定本次构建的 WorkPal.exe。'
+    }
 }
 
-$Action  = New-ScheduledTaskAction -Execute $ExePath
+if (-not (Test-Path -LiteralPath $ExePath -PathType Leaf)) {
+    throw '指定的启动程序不存在'
+}
+$ExePath = (Resolve-Path -LiteralPath $ExePath).Path
+if (-not $WorkingDirectory) {
+    $WorkingDirectory = Split-Path -Parent ([string]$ExePath)
+}
+
+$ActionParams = @{
+    Execute = $ExePath
+    WorkingDirectory = $WorkingDirectory
+}
+if ($Arguments) {
+    $ActionParams.Argument = $Arguments
+}
+$Action  = New-ScheduledTaskAction @ActionParams
 $Trigger = New-ScheduledTaskTrigger -AtLogOn
 
 $Settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
-    -StartWhenAvailable
+    -StartWhenAvailable `
+    -ExecutionTimeLimit ([TimeSpan]::Zero)
 
 $Principal = New-ScheduledTaskPrincipal `
     -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
     -RunLevel Highest `
     -LogonType Interactive
 
-# 如果任务已存在则先删除
-if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-    Write-Host "[提示] 已删除旧任务: $TaskName" -ForegroundColor Yellow
-}
-
 Register-ScheduledTask `
     -TaskName  $TaskName `
+    -TaskPath '\' -Force `
     -Action    $Action `
     -Trigger   $Trigger `
     -Settings  $Settings `
     -Principal $Principal `
-    -Description 'WorkPal 工作助手 开机自启动'
+    -Description 'WorkPal 工作助手 开机自启动' -ErrorAction Stop | Out-Null
+
+$Registered = Get-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction Stop
+if (-not $Registered.Settings.Enabled -or [System.Xml.XmlConvert]::ToTimeSpan($Registered.Settings.ExecutionTimeLimit) -ne [TimeSpan]::Zero) {
+    throw '任务注册后的状态或运行时限不正确'
+}
 
 Write-Host "[成功] 已创建自启动任务: $TaskName" -ForegroundColor Green
 Write-Host "       程序路径: $ExePath" -ForegroundColor Cyan
