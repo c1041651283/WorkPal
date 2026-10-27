@@ -1,19 +1,24 @@
-"""Windows 任务计划开机自启动管理。"""
+"""Windows 任务计划开机自启动管理（任务计划 COM 接口，不启动 PowerShell）。"""
 
 from __future__ import annotations
 
 import logging
-import subprocess
 import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+
+import pythoncom
+import win32api
+import win32com.client
+import win32con
 
 from workpal.system import is_frozen
 
 logger = logging.getLogger(__name__)
 
 TASK_NAME = 'WorkPal_AutoStart'
+TASK_DESCRIPTION = 'WorkPal 工作助手 开机自启动'
 
 STATUS_UNKNOWN = 'unknown'
 STATUS_CHECKING = 'checking'
@@ -21,6 +26,16 @@ STATUS_ENABLED = 'enabled'
 STATUS_DISABLED = 'disabled'
 STATUS_OUTDATED = 'outdated'
 STATUS_FAILED = 'failed'
+
+# Task Scheduler 2.0 常量
+_ROOT_FOLDER = '\\'
+_ERROR_FILE_NOT_FOUND = -2147024894  # HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)
+_TASK_TRIGGER_LOGON = 9
+_TASK_ACTION_EXEC = 0
+_TASK_CREATE_OR_UPDATE = 6
+_TASK_LOGON_INTERACTIVE_TOKEN = 3
+_TASK_RUNLEVEL_HIGHEST = 1
+_NO_TIME_LIMIT = 'PT0S'
 
 _status_lock = threading.RLock()
 _cached_status = STATUS_UNKNOWN
@@ -60,43 +75,63 @@ def build_launch_target(
     )
 
 
+def _connect():
+    """返回已连接的任务计划服务；COM 按线程初始化，由系统在线程/进程退出时清理。"""
+    pythoncom.CoInitialize()
+    service = win32com.client.Dispatch('Schedule.Service')
+    service.Connect()
+    return service
+
+
+def _find_task(folder):
+    try:
+        return folder.GetTask(TASK_NAME)
+    except pythoncom.com_error as exc:
+        if exc.hresult == _ERROR_FILE_NOT_FOUND:
+            return None
+        raise
+
+
+def _same_text(actual, expected: str) -> bool:
+    return str(actual or '').casefold() == expected.casefold()
+
+
+def _matches_target(definition, target: LaunchTarget) -> bool:
+    """只有唯一一个启动动作且路径、参数、工作目录都指向当前程序才算有效。"""
+    actions = definition.Actions
+    if actions.Count != 1:
+        return False
+    action = actions.Item(1)
+    return (action.Type == _TASK_ACTION_EXEC
+            and _same_text(action.Path, target.execute)
+            and str(action.Arguments or '') == target.arguments
+            and _same_text(action.WorkingDirectory, target.working_directory)
+            and Path(target.execute).is_file()
+            and Path(target.working_directory).is_dir())
+
+
+def _task_status(task, target: LaunchTarget) -> str:
+    if task is None or not task.Enabled:
+        return STATUS_DISABLED
+    return STATUS_ENABLED if _matches_target(task.Definition, target) else STATUS_OUTDATED
+
+
+def _query_status() -> str:
+    """返回 enabled/disabled/outdated；查询失败时抛出异常。"""
+    folder = _connect().GetFolder(_ROOT_FOLDER)
+    return _task_status(_find_task(folder), build_launch_target())
+
+
+def _describe(exc: Exception) -> str:
+    if isinstance(exc, pythoncom.com_error):
+        detail = exc.excepinfo[2] if exc.excepinfo and exc.excepinfo[2] else exc.strerror
+        return f'{detail}（0x{exc.hresult & 0xFFFFFFFF:08X}）'
+    return str(exc)
+
+
 def is_enabled() -> bool:
     """同步检查自启动是否指向当前程序。菜单线程不要直接调用。"""
-    enabled, reason = _query_autostart_enabled()
-    if enabled is None:
-        raise RuntimeError(reason or '查询任务计划失败')
-    return enabled
-
-
-def _query_autostart_enabled() -> tuple[bool | None, str]:
-    """返回当前程序的自启动状态；旧任务返回 False/outdated，查询失败返回 None。"""
-    target = build_launch_target()
-    command = (
-        f"$Task = Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | Where-Object {{ $_.TaskName -eq '{TASK_NAME}' }}\n"
-        + _target_check_command('$Task', target)
-        + "\nif ($null -eq $Task -or -not $Task.Settings.Enabled) { 'disabled' } "
-          "elseif ($MatchesTarget) { 'enabled' } else { 'outdated' }"
-    )
-    success, output = _run_powershell(command)
-    if not success:
-        return None, output
-    value = output.strip().lower()
-    if value not in ('enabled', 'disabled', 'outdated'):
-        return None, '任务计划返回了无法识别的状态'
-    return value == 'enabled', output
-
-
-def _target_check_command(task: str, target: LaunchTarget) -> str:
-    """查询及注册后验证复用同一组检查；task 只能由内部固定变量名传入。"""
-    return f"""
-$Actions = @({task}.Actions)
-$MatchesTarget = ($Actions.Count -eq 1 -and
-    [string]$Actions[0].Execute -ieq '{_ps_quote(target.execute)}' -and
-    [string]$Actions[0].Arguments -ceq '{_ps_quote(target.arguments)}' -and
-    [string]$Actions[0].WorkingDirectory -ieq '{_ps_quote(target.working_directory)}' -and
-    (Test-Path -LiteralPath '{_ps_quote(target.execute)}' -PathType Leaf) -and
-    (Test-Path -LiteralPath '{_ps_quote(target.working_directory)}' -PathType Container))
-"""
+    return _query_status() == STATUS_ENABLED
 
 
 def _set_cached_status(status: str, error: str = '') -> None:
@@ -122,21 +157,15 @@ def refresh_autostart_status_async(
     on_done=None,
     wait: bool = False,
 ) -> threading.Thread:
-    """后台刷新任务计划状态，避免托盘菜单打开时同步执行 PowerShell。"""
+    """后台刷新任务计划状态，避免托盘菜单打开时同步查询。"""
     _set_cached_status(STATUS_CHECKING)
 
     def _worker() -> None:
         try:
-            enabled, reason = _query_autostart_enabled()
-            if enabled is None:
-                _set_cached_status(STATUS_FAILED, reason)
-            elif reason.strip().lower() == STATUS_OUTDATED:
-                _set_cached_status(STATUS_OUTDATED)
-            else:
-                _set_cached_status(STATUS_ENABLED if enabled else STATUS_DISABLED)
+            _set_cached_status(_query_status())
         except Exception as exc:
             logger.exception('刷新自启动状态失败')
-            _set_cached_status(STATUS_FAILED, str(exc))
+            _set_cached_status(STATUS_FAILED, _describe(exc))
         finally:
             if on_done is not None:
                 try:
@@ -151,92 +180,64 @@ def refresh_autostart_status_async(
     return thread
 
 
-def enable_autostart() -> tuple[bool, str]:
-    """创建或覆盖开机自启动任务。需要管理员权限。"""
-    target = build_launch_target()
-    action_argument = ''
+def _build_definition(service, target: LaunchTarget):
+    definition = service.NewTask(0)
+    definition.RegistrationInfo.Description = TASK_DESCRIPTION
+    definition.Triggers.Create(_TASK_TRIGGER_LOGON)
+    principal = definition.Principal
+    principal.UserId = win32api.GetUserNameEx(win32con.NameSamCompatible)
+    principal.LogonType = _TASK_LOGON_INTERACTIVE_TOKEN
+    principal.RunLevel = _TASK_RUNLEVEL_HIGHEST
+    settings = definition.Settings
+    settings.Enabled = True
+    settings.DisallowStartIfOnBatteries = False
+    settings.StopIfGoingOnBatteries = False
+    settings.StartWhenAvailable = True
+    settings.ExecutionTimeLimit = _NO_TIME_LIMIT
+    action = definition.Actions.Create(_TASK_ACTION_EXEC)
+    action.Path = target.execute
     if target.arguments:
-        action_argument = (
-            f"\n$ActionParams.Argument = '{_ps_quote(target.arguments)}'"
-        )
-    command = f"""
-$TaskName = '{TASK_NAME}'
-$ActionParams = @{{
-    Execute = '{_ps_quote(target.execute)}'
-    WorkingDirectory = '{_ps_quote(target.working_directory)}'
-}}{action_argument}
-$Action = New-ScheduledTaskAction @ActionParams
-$Trigger = New-ScheduledTaskTrigger -AtLogOn
-$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
-$Principal = New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) -RunLevel Highest -LogonType Interactive
-Register-ScheduledTask -TaskName $TaskName -TaskPath '\\' -Force -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description 'WorkPal 工作助手 开机自启动' -ErrorAction Stop | Out-Null
-$Registered = Get-ScheduledTask -TaskName $TaskName -TaskPath '\\' -ErrorAction Stop
-{_target_check_command('$Registered', target)}
-if (-not $MatchesTarget -or -not $Registered.Settings.Enabled -or [System.Xml.XmlConvert]::ToTimeSpan($Registered.Settings.ExecutionTimeLimit) -ne [TimeSpan]::Zero) {{
-    throw '任务注册后的启动路径、状态或运行时限不正确'
-}}
-"""
-    success, output = _run_powershell(command)
-    if not success:
-        logger.error('启用自启动失败: %s', output)
-        _set_cached_status(STATUS_FAILED, output)
-    else:
-        _set_cached_status(STATUS_ENABLED)
-    return success, output
+        action.Arguments = target.arguments
+    action.WorkingDirectory = target.working_directory
+    return definition
+
+
+def enable_autostart() -> tuple[bool, str]:
+    """创建或覆盖开机自启动任务，注册后重新读取验证。需要管理员权限。"""
+    target = build_launch_target()
+    try:
+        service = _connect()
+        folder = service.GetFolder(_ROOT_FOLDER)
+        definition = _build_definition(service, target)
+        # 用户和密码留空（VT_EMPTY），使用定义中的交互式令牌主体。
+        folder.RegisterTaskDefinition(TASK_NAME, definition, _TASK_CREATE_OR_UPDATE,
+                                      pythoncom.Empty, pythoncom.Empty,
+                                      _TASK_LOGON_INTERACTIVE_TOKEN)
+        registered = _find_task(folder)
+        if (_task_status(registered, target) != STATUS_ENABLED
+                or registered.Definition.Settings.ExecutionTimeLimit != _NO_TIME_LIMIT):
+            raise RuntimeError('任务注册后的启动路径、状态或运行时限不正确')
+    except Exception as exc:
+        reason = _describe(exc)
+        logger.error('启用自启动失败: %s', reason)
+        _set_cached_status(STATUS_FAILED, reason)
+        return False, reason
+    _set_cached_status(STATUS_ENABLED)
+    return True, ''
 
 
 def disable_autostart() -> tuple[bool, str]:
-    """删除开机自启动任务。需要管理员权限。"""
-    command = f"""
-$TaskName = '{TASK_NAME}'
-$Task = Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | Where-Object {{ $_.TaskName -eq $TaskName }}
-if ($null -ne $Task) {{
-    Unregister-ScheduledTask -TaskName $TaskName -TaskPath '\\' -Confirm:$false -ErrorAction Stop
-}}
-if (Get-ScheduledTask -TaskPath '\\' -ErrorAction Stop | Where-Object {{ $_.TaskName -eq $TaskName }}) {{
-    throw '任务删除后仍存在'
-}}
-"""
-    success, output = _run_powershell(command)
-    if not success:
-        logger.error('禁用自启动失败: %s', output)
-        _set_cached_status(STATUS_FAILED, output)
-    else:
-        _set_cached_status(STATUS_DISABLED)
-    return success, output
-
-
-def _run_powershell(command: str) -> tuple[bool, str]:
-    command = ("$ErrorActionPreference = 'Stop'\ntry {\n" + command +
-               "\n} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }\n")
-    startupinfo = None
-    if hasattr(subprocess, 'STARTUPINFO'):
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-
+    """删除开机自启动任务并确认已不存在。需要管理员权限。"""
     try:
-        completed = subprocess.run(
-            [
-                'powershell.exe',
-                '-NoProfile',
-                '-ExecutionPolicy',
-                'Bypass',
-                '-Command',
-                command,
-            ],
-            capture_output=True,
-            text=True,
-            startupinfo=startupinfo,
-            timeout=30,
-        )
+        folder = _connect().GetFolder(_ROOT_FOLDER)
+        if _find_task(folder) is not None:
+            folder.DeleteTask(TASK_NAME, 0)
+        if _find_task(folder) is not None:
+            raise RuntimeError('任务删除后仍存在')
     except Exception as exc:
-        return False, str(exc)
-
-    output = '\n'.join(
-        part.strip() for part in (completed.stdout, completed.stderr) if part.strip()
-    )
-    return completed.returncode == 0, output
-
-
-def _ps_quote(value: str) -> str:
-    return value.replace("'", "''")
+        reason = _describe(exc)
+        logger.error('禁用自启动失败: %s', reason)
+        _set_cached_status(STATUS_FAILED, reason)
+        return False, reason
+    _set_cached_status(STATUS_DISABLED)
+    return True, ''

@@ -1,55 +1,118 @@
-"""执行真实 PowerShell 控制流，所有任务计划命令均由内存函数替代。"""
+"""任务计划 COM 调用流程；用内存替身代替 Schedule.Service，不注册真实任务。"""
 
-import subprocess
-
+import pythoncom
 import pytest
 
 from workpal.features import autostart
+from tests import fake_task_scheduler as fake
 
 
-STUBS = r'''
-$script:Registered = $null
-function New-ScheduledTaskAction {
-    [CmdletBinding()] param($Execute, $WorkingDirectory, $Argument)
-    [pscustomobject]@{ Execute=$Execute; Arguments=$Argument; WorkingDirectory=$WorkingDirectory }
-}
-function New-ScheduledTaskTrigger { [CmdletBinding()] param([switch]$AtLogOn) @{} }
-function New-ScheduledTaskSettingsSet {
-    [CmdletBinding()] param([switch]$AllowStartIfOnBatteries, [switch]$DontStopIfGoingOnBatteries,
-        [switch]$StartWhenAvailable, [TimeSpan]$ExecutionTimeLimit)
-    if ($ExecutionTimeLimit -ne [TimeSpan]::Zero) { throw 'finite execution time' }
-    [pscustomobject]@{ Enabled=$true; ExecutionTimeLimit='PT0S' }
-}
-function New-ScheduledTaskPrincipal { [CmdletBinding()] param($UserId,$RunLevel,$LogonType) @{} }
-function Register-ScheduledTask {
-    [CmdletBinding()] param($TaskName,$TaskPath,[switch]$Force,$Action,$Trigger,$Settings,$Principal,$Description)
-    __REGISTER__
-}
-function Get-ScheduledTask { [CmdletBinding()] param($TaskName,$TaskPath) $script:Registered }
-function Unregister-ScheduledTask { [CmdletBinding()] param($TaskName,$TaskPath,[switch]$Confirm) $script:Registered=$null }
-'''
+@pytest.fixture
+def scheduler(monkeypatch, tmp_path):
+    service = fake.Service()
+    executable = tmp_path / 'WorkPal.exe'
+    executable.touch()
+    target = autostart.LaunchTarget(str(executable), '', str(tmp_path))
+    monkeypatch.setattr(autostart, '_connect', lambda: service)
+    monkeypatch.setattr(autostart, 'build_launch_target', lambda: target)
+    return service.folder, target
 
 
-@pytest.mark.parametrize('registration,expected', [
-    ("Write-Error 'simulated registration failure'", False),
-    ("$script:Registered=[pscustomobject]@{ TaskName=$TaskName; Settings=$Settings; Actions=@($Action) }", True),
-    ("$script:Registered=[pscustomobject]@{ TaskName=$TaskName; Settings=[pscustomobject]@{ Enabled=$false; ExecutionTimeLimit='PT72H' }; Actions=@($Action) }", False),
-    ("$Action.Execute='Z:\\missing-old-package\\WorkPal.exe'; $script:Registered=[pscustomobject]@{ TaskName=$TaskName; Settings=$Settings; Actions=@($Action) }", False),
-    ('', False),
-])
-def test_registration_result_is_verified_with_real_powershell(monkeypatch, registration, expected):
-    native_run = subprocess.run
-    def run_with_stubs(args, **kwargs):
-        return native_run([*args[:-1], STUBS.replace('__REGISTER__', registration) + args[-1]], **kwargs)
-    monkeypatch.setattr(autostart.subprocess, 'run', run_with_stubs)
+def test_enable_registers_logon_task_with_highest_privilege_and_no_time_limit(scheduler):
+    folder, target = scheduler
+    assert autostart.enable_autostart() == (True, '')
+    name, definition, flags, user, password, logon = folder.registrations[-1]
+    assert (name, flags, logon) == ('WorkPal_AutoStart', 6, 3)
+    # 用户和密码留空，不在注册调用中传递任何凭据。
+    assert user is pythoncom.Empty and password is pythoncom.Empty
+    assert [t.Type for t in definition.Triggers] == [9]
+    assert definition.Principal.RunLevel == 1 and definition.Principal.LogonType == 3
+    assert definition.Principal.UserId
+    settings = definition.Settings
+    assert settings.ExecutionTimeLimit == 'PT0S' and settings.StartWhenAvailable
+    assert not settings.DisallowStartIfOnBatteries and not settings.StopIfGoingOnBatteries
+    [action] = definition.Actions
+    assert (action.Path, action.Arguments, action.WorkingDirectory) == (target.execute, '', target.working_directory)
+    assert autostart.get_cached_autostart_status() == autostart.STATUS_ENABLED
+
+
+def test_source_run_keeps_main_script_argument(scheduler, monkeypatch, tmp_path):
+    folder, _ = scheduler
+    python = tmp_path / 'python.exe'
+    python.touch()
+    target = autostart.LaunchTarget(str(python), f'"{tmp_path / "main.py"}"', str(tmp_path))
+    monkeypatch.setattr(autostart, 'build_launch_target', lambda: target)
+    assert autostart.enable_autostart()[0]
+    [action] = folder.registrations[-1][1].Actions
+    assert action.Arguments == target.arguments
+
+
+def _disable(folder, name):
+    folder.tasks[name].Enabled = False
+
+
+def _time_limit(folder, name):
+    folder.tasks[name].Definition.Settings.ExecutionTimeLimit = 'PT72H'
+
+
+def _old_path(folder, name):
+    folder.tasks[name].Definition.Actions[0].Path = r'Z:\missing-old-package\WorkPal.exe'
+
+
+def _vanish(folder, name):
+    del folder.tasks[name]
+
+
+def _denied(folder, name):
+    raise fake.com_error(fake.ACCESS_DENIED, 'Access is denied.')
+
+
+@pytest.mark.parametrize('after_register', [_disable, _time_limit, _old_path, _vanish, _denied])
+def test_registration_result_is_verified(scheduler, after_register):
+    folder, _ = scheduler
+    folder.after_register = after_register
     success, reason = autostart.enable_autostart()
-    assert success is expected
-    assert autostart.get_cached_autostart_status() == (autostart.STATUS_ENABLED if expected else autostart.STATUS_FAILED)
-    if not expected:
-        assert reason
+    assert not success and reason
+    assert autostart.get_cached_autostart_status() == autostart.STATUS_FAILED
+    assert reason in autostart.get_cached_autostart_error()
 
 
-@pytest.mark.parametrize('output,expected', [('enabled', True), ('disabled', False), ('unexpected enabled text', None)])
-def test_task_status_requires_exact_result(monkeypatch, output, expected):
-    monkeypatch.setattr(autostart, '_run_powershell', lambda command: (True, output))
-    assert autostart._query_autostart_enabled()[0] is expected
+def test_access_denied_reason_is_readable(scheduler):
+    folder, _ = scheduler
+    folder.after_register = _denied
+    _, reason = autostart.enable_autostart()
+    assert 'Access is denied.' in reason and '0x80070005' in reason
+
+
+def test_disable_removes_task_and_verifies(scheduler):
+    folder, target = scheduler
+    folder.tasks['WorkPal_AutoStart'] = fake.make_task(target.execute, '', target.working_directory)
+    assert autostart.disable_autostart() == (True, '')
+    assert 'WorkPal_AutoStart' not in folder.tasks
+    assert autostart.get_cached_autostart_status() == autostart.STATUS_DISABLED
+    # 任务本来就不存在也算成功。
+    assert autostart.disable_autostart() == (True, '')
+
+
+def test_disable_reports_task_that_survives_deletion(scheduler):
+    folder, target = scheduler
+    folder.tasks['WorkPal_AutoStart'] = fake.make_task(target.execute, '', target.working_directory)
+    folder.delete_ignored = True
+    success, reason = autostart.disable_autostart()
+    assert not success and '仍存在' in reason
+    assert autostart.get_cached_autostart_status() == autostart.STATUS_FAILED
+
+
+def test_refresh_updates_cache_and_query_errors_are_failures(scheduler):
+    folder, target = scheduler
+    folder.tasks['WorkPal_AutoStart'] = fake.make_task(target.execute, '', target.working_directory)
+    thread = autostart.refresh_autostart_status_async(wait=True)
+    assert not thread.is_alive()
+    assert autostart.get_cached_autostart_status() == autostart.STATUS_ENABLED
+    assert autostart.is_enabled()
+    folder.get_error = fake.ACCESS_DENIED
+    autostart.refresh_autostart_status_async(wait=True)
+    assert autostart.get_cached_autostart_status() == autostart.STATUS_FAILED
+    assert '0x80070005' in autostart.get_cached_autostart_error()
+    with pytest.raises(pythoncom.com_error):
+        autostart.is_enabled()

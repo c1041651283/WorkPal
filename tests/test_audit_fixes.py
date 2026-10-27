@@ -141,41 +141,31 @@ def test_outdated_autostart_menu_updates_instead_of_disabling():
 
 
 @pytest.mark.parametrize('kind,expected', [
-    ('current', True), ('old', False), ('missing', False),
-    ('arguments', False), ('directory', False), ('disabled', False), ('absent', False),
+    ('current', 'enabled'), ('old', 'outdated'), ('missing', 'outdated'),
+    ('arguments', 'outdated'), ('directory', 'outdated'), ('two-actions', 'outdated'),
+    ('disabled', 'disabled'), ('absent', 'disabled'),
 ])
 def test_autostart_checks_actual_launch_target(tmp_path, kind, expected):
+    from tests import fake_task_scheduler as fake
     executable = tmp_path / "WorkPal's.exe"
     executable.touch()
     old_executable = tmp_path / 'old.exe'
     old_executable.touch()
     target = autostart.LaunchTarget(str(executable), '', str(tmp_path))
-    actual = str(old_executable) if kind == 'old' else str(executable)
+    service = fake.Service()
+    if kind != 'absent':
+        task = fake.make_task(
+            str(old_executable) if kind == 'old' else str(executable).upper(),
+            '--old' if kind == 'arguments' else '',
+            str(tmp_path / 'old') if kind == 'directory' else str(tmp_path),
+            enabled=kind != 'disabled')
+        if kind == 'two-actions':
+            task.Definition.Actions.Create(0)
+        service.folder.tasks['WorkPal_AutoStart'] = task
     if kind == 'missing':
         executable.unlink()
-    quote = autostart._ps_quote
-    stub = f"""
-function Get-ScheduledTask {{
-    [CmdletBinding()] param($TaskPath)
-    {'return' if kind == 'absent' else ''}
-    [pscustomobject]@{{
-        TaskName='WorkPal_AutoStart'
-        Settings=[pscustomobject]@{{Enabled=${'false' if kind == 'disabled' else 'true'}; ExecutionTimeLimit='PT0S'}}
-        Actions=@([pscustomobject]@{{
-            Execute='{quote(actual)}'
-            Arguments='{'--old' if kind == 'arguments' else ''}'
-            WorkingDirectory='{quote(str(tmp_path / 'old') if kind == 'directory' else str(tmp_path))}'
-        }})
-    }}
-}}
-"""
-    run = autostart._run_powershell
     with patch.object(autostart, 'build_launch_target', return_value=target), \
-         patch.object(autostart, '_run_powershell', side_effect=lambda command: run(stub + command)):
-        enabled, reason = autostart._query_autostart_enabled()
-        assert enabled is expected
-        if kind not in ('current', 'disabled', 'absent'):
-            assert reason == 'outdated'
+         patch.object(autostart, '_connect', return_value=service):
+        assert autostart._query_status() == expected
         autostart.refresh_autostart_status_async(wait=True)
-        if kind not in ('current', 'disabled', 'absent'):
-            assert autostart.get_cached_autostart_status() == 'outdated'
+        assert autostart.get_cached_autostart_status() == expected
