@@ -29,8 +29,3 @@ def get_user_data_path(relative_path: str = '') -> str:
     base = local_app_data / 'WorkPal'
     base.mkdir(parents=True, exist_ok=True)
     return str(base / relative_path) if relative_path else str(base)
-
-
-def exit_app() -> None:
-    """退出程序。"""
-    sys.exit(0)

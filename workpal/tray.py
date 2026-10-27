@@ -10,6 +10,7 @@ workpal/tray.py
   - 通知附带失败原因
 """
 
+import functools
 import threading
 import logging
 
@@ -19,16 +20,19 @@ from PIL import Image, ImageDraw, UnidentifiedImageError
 
 import workpal.features.network as network
 import workpal.features.keep_alive as keep_alive
-from workpal.system import get_resource_path, exit_app
+from workpal import __version__
+from workpal.system import get_resource_path
 
 logger = logging.getLogger(__name__)
 
 APP_NAME = 'WorkPal 工作助手'
-VERSION = 'v1.2.4'
+VERSION = f'v{__version__}'
 
 # 防止网络切换重入
 _switch_lock = threading.Lock()
 _autostart_lock = threading.Lock()
+# 网络切换线程运行期间显示“切换中”图标
+_switching = False
 
 # 全局图标引用（供其他模块发送通知）
 _icon_ref: pystray.Icon | None = None
@@ -54,6 +58,7 @@ _ICON_PATHS = {
 }
 
 
+@functools.lru_cache(maxsize=None)
 def _load_icon(name: str) -> Image.Image:
     path = get_resource_path(_ICON_PATHS.get(name, _ICON_PATHS['default']))
     try:
@@ -79,6 +84,18 @@ def _set_icon(icon: pystray.Icon, name: str) -> None:
         logger.warning(f"切换图标失败 [{name}]: {e}")
 
 
+def _refresh_icon(icon: pystray.Icon, mode: str | None = None) -> None:
+    """按“切换中 > 保持在线 > 网络模式”的优先级统一计算图标。"""
+    if _switching:
+        name = 'switching'
+    elif keep_alive.is_active():
+        name = 'alive'
+    else:
+        mode = mode or _current_network_mode()
+        name = mode if mode in ('wifi', 'ethernet') else 'default'
+    _set_icon(icon, name)
+
+
 # ---------------------------------------------------------------------------
 # 菜单回调
 # ---------------------------------------------------------------------------
@@ -91,11 +108,20 @@ def _on_about(icon: pystray.Icon, item) -> None:
 
 
 def _on_quit(icon: pystray.Icon, item) -> None:
+    """停止代理守护最多等待 20 秒，放到后台线程，避免托盘无响应。"""
     if not _switch_lock.acquire(blocking=False):
         icon.notify(title='请稍候', message='正在切换或恢复网络，完成后再退出')
         return
+    threading.Thread(target=_quit_and_release, args=(icon,), daemon=True,
+                     name='quit').start()
+
+
+def _quit_and_release(icon: pystray.Icon) -> None:
     try:
         _quit_when_idle(icon)
+    except Exception:
+        logger.exception('退出失败')
+        icon.notify(title='退出失败', message='请查看日志后重试')
     finally:
         _switch_lock.release()
 
@@ -108,8 +134,8 @@ def _quit_when_idle(icon: pystray.Icon) -> None:
     keep_alive.toggle_keep_alive(False)
     from workpal.features.session_events import session_events
     session_events.stop()
+    # icon.run() 返回后由 main() 释放单实例并正常退出。
     icon.stop()
-    exit_app()
 
 
 def _on_autostart_toggle(icon: pystray.Icon, item) -> None:
@@ -177,13 +203,11 @@ def _on_keep_alive(icon: pystray.Icon, item) -> None:
     """切换保持在线状态。"""
     new_state = not keep_alive.is_active()
     keep_alive.toggle_keep_alive(new_state)
+    _refresh_icon(icon)
 
     if new_state:
-        _set_icon(icon, 'alive')
         icon.notify(title='保持在线状态', message='✓ 已开启，将定期模拟按键防止空闲')
     else:
-        mode = _current_network_mode()
-        _set_icon(icon, mode if mode in ('wifi', 'ethernet') else 'default')
         icon.notify(title='保持在线状态', message='已关闭')
 
     icon.update_menu()
@@ -226,33 +250,33 @@ def _on_switch_network(icon: pystray.Icon, item) -> None:
 
 def _do_switch_and_release(icon: pystray.Icon) -> None:
     """后台线程：执行切换，完成后释放锁并更新图标。"""
+    global _switching
+    new_mode = None
     try:
         current_mode = network.get_current_mode()
         logger.info(f"触发网络切换，当前模式: {current_mode}")
-        _set_icon(icon, 'switching')
+        _switching = True
+        _refresh_icon(icon)
 
         if current_mode == 'wifi':
             icon.notify(title='网络切换', message='正在切换到有线网络...')
             success, reason = network.switch_to_ethernet()
             if success:
-                _set_icon(icon, 'ethernet')
+                new_mode = 'ethernet'
                 icon.notify(title='网络切换', message='✓ 已切换到有线网络')
             else:
-                _set_icon(icon, _current_network_mode())
                 icon.notify(title='网络切换', message=f'✗ 切换失败：{reason}')
 
         elif current_mode == 'ethernet':
             icon.notify(title='网络切换', message='正在切换到 WiFi...')
             success, reason = network.switch_to_wifi()
             if success:
-                _set_icon(icon, 'wifi')
+                new_mode = 'wifi'
                 icon.notify(title='网络切换', message='✓ 已切换到 WiFi')
             else:
-                _set_icon(icon, _current_network_mode())
                 icon.notify(title='网络切换', message=f'✗ 切换失败：{reason}')
 
         else:
-            _set_icon(icon, 'default')
             icon.notify(title='网络切换', message='✗ 无法识别当前网络状态，请手动检查')
 
         icon.update_menu()
@@ -260,6 +284,8 @@ def _do_switch_and_release(icon: pystray.Icon) -> None:
         logger.error(f"网络切换异常: {e}")
         icon.notify(title='错误', message=f'程序异常: {e}')
     finally:
+        _switching = False
+        _refresh_icon(icon, new_mode)
         _switch_lock.release()
 
 
@@ -422,6 +448,7 @@ def _on_tray_setup(icon: pystray.Icon) -> None:
     """启动时只设置脚本代理，不自动开启守护或检疫流程。"""
     _switch_lock.acquire()
     icon.visible = True
+    _refresh_icon(icon)
     _do_script_proxy(icon)
     try:
         from workpal.features import autostart
