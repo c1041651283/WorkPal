@@ -13,7 +13,6 @@ CONFIG: dict = {
     'wifi_adapter_name': 'WLAN',
     'ethernet_adapter_name': '以太网',
     'wifi_ssid': '',
-    'wifi_password': '',
     'ethernet_program_path': '',
     # FortiClient 代理助手：仅手动启动，不改变 VPN 自身的连接配置。
     'forticlient_path': '',
@@ -26,7 +25,6 @@ _KEY_MAP = {
     'WIFI_ADAPTER_NAME': 'wifi_adapter_name',
     'ETHERNET_ADAPTER_NAME': 'ethernet_adapter_name',
     'WIFI_SSID': 'wifi_ssid',
-    'WIFI_PASSWORD': 'wifi_password',
     'ETHERNET_PROGRAM_PATH': 'ethernet_program_path',
     'FORTICLIENT_PATH': 'forticlient_path',
     'VPN_PROXY_SERVER': 'vpn_proxy_server',
@@ -64,6 +62,9 @@ def load_config(config_file: str | Path | None = None) -> None:
                 value = value.strip()
                 if key in _KEY_MAP:
                     CONFIG[_KEY_MAP[key]] = value
+                elif key == 'WIFI_PASSWORD' and value:
+                    # 不保留值；切换 WiFi 改用 Windows 已保存的配置。
+                    logger.warning('WIFI_PASSWORD 已不再使用，建议从配置文件中删除这行明文密码')
 
         logger.info(
             f"配置加载成功 | WiFi 网卡={CONFIG['wifi_adapter_name']} "

@@ -203,12 +203,32 @@ def test_tunnel_detection(adapters, expected):
 
 def test_probe_timeout_preserves_known_adapter_state_and_only_probes_tcp():
     with patch.object(vpn, 'read_adapters', return_value=[adapter(2, ['10.1.2.3'])]), \
-         patch.object(vpn.subprocess, 'run', side_effect=subprocess.TimeoutExpired('read', 8)) as run:
+         patch.object(vpn, '_resolve', return_value=[(2, 1, 6, '', ('10.0.0.1', 8080))]), \
+         patch.object(vpn.socket, 'socket') as sock, \
+         patch.object(vpn.subprocess, 'run') as run:
+        sock.return_value.__enter__.return_value.connect.side_effect = TimeoutError()
         assert vpn.query_tunnel(SERVER) == vpn.TunnelStatus('connected', False)
-    command = run.call_args.args[0][-1]
-    assert 'BeginConnect' in command and 'CimInstance' not in command
-    assert 'Set-' not in command and 'Disable-' not in command and 'Enable-' not in command
-    assert '--connect' not in command and '--disconnect' not in command
+    run.assert_not_called()
+    connection = sock.return_value.__enter__.return_value
+    connection.connect.assert_called_once_with(('10.0.0.1', 8080))
+    connection.send.assert_not_called()
+    connection.sendall.assert_not_called()
+
+
+def test_probe_connects_to_local_listener_and_rejects_closed_port():
+    import socket
+    with socket.create_server(('127.0.0.1', 0)) as server:
+        port = server.getsockname()[1]
+        assert vpn.probe_proxy(f'127.0.0.1:{port}')
+    assert not vpn.probe_proxy(f'127.0.0.1:{port}')
+
+
+def test_probe_dns_failure_or_timeout_is_not_ready():
+    with patch.object(vpn, '_resolve', side_effect=TimeoutError('slow dns')):
+        assert vpn.probe_proxy(SERVER) is False
+    with patch.object(vpn.socket, 'getaddrinfo', side_effect=lambda *a, **k: __import__('time').sleep(1)), \
+         patch.object(vpn, 'PROBE_TIMEOUT_SECONDS', 0.05):
+        assert vpn.probe_proxy(SERVER) is False
 
 
 @pytest.mark.parametrize('value', ['bad;command:80', "host'bad:80", 'host:0', 'host:65536',
@@ -461,16 +481,13 @@ def test_bad_query_or_write_does_not_restore_original_pac(manager_environment):
 
 
 def test_query_office_result_and_literal_adapter_name_are_handled():
-    result = MagicMock(stdout='true')
     office = dict(adapter(2, ['10.1.2.3'], name='Intel Ethernet'),
                   friendly_name="Office'LAN", interface_type=6)
     with patch.dict('workpal.config.CONFIG', {'ethernet_adapter_name': "Office'LAN"}), \
          patch.object(vpn, 'read_adapters', return_value=[office]), \
-         patch.object(vpn.subprocess, 'run', return_value=result) as run:
+         patch.object(vpn, 'probe_proxy', return_value=True) as probe:
         assert vpn.query_tunnel(SERVER).ready
-    script = run.call_args.args[0][-1]
-    assert 'Office' not in script  # 网卡名不再被插入 PowerShell 命令。
-    assert 'Set-' not in script and 'Disable-' not in script
+    probe.assert_called_once_with(SERVER)  # 只探测代理地址，网卡名不进入任何命令。
 
 
 def test_menu_has_manual_guard_controls_and_no_application_feature():
@@ -759,3 +776,29 @@ def test_request_during_single_check_cleanup_starts_after_resources_release(mana
     start = stack.enter_context(patch.object(manager, '_start_locked', side_effect=next_start))
     manager._run(lambda _: None, once=True)
     start.assert_called_once()
+
+
+def test_proxy_ownership_releases_mutex_and_network_lock_on_error():
+    with patch('win32event.CreateMutex', return_value=7), \
+         patch('win32event.WaitForSingleObject', return_value=0), \
+         patch('win32event.ReleaseMutex') as release, patch('win32api.CloseHandle') as close:
+        with pytest.raises(OSError):
+            with vpn._proxy_ownership('busy', 'switching'):
+                assert vpn.network_change_lock.locked()
+                raise OSError('write failed')
+        with vpn._proxy_ownership('busy'):
+            assert not vpn.network_change_lock.locked()
+    assert not vpn.network_change_lock.locked()
+    assert release.call_count == 2 and close.call_count == 2
+
+
+def test_proxy_ownership_busy_mutex_never_takes_network_lock():
+    with patch('win32event.CreateMutex', return_value=7), \
+         patch('win32event.WaitForSingleObject', return_value=258), \
+         patch('win32event.ReleaseMutex') as release, patch('win32api.CloseHandle') as close:
+        with pytest.raises(RuntimeError, match='busy'):
+            with vpn._proxy_ownership('busy', 'switching'):
+                pass
+    release.assert_not_called()
+    close.assert_called_once_with(7)
+    assert not vpn.network_change_lock.locked()

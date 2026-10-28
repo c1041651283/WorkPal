@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import ipaddress
-import json
 import logging
 import os
 from pathlib import Path
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -24,6 +25,7 @@ from workpal.features.adapter_status import read_adapters
 logger = logging.getLogger(__name__)
 POLL_SECONDS = 60
 RESUME_CHECK_SECONDS = 5
+PROBE_TIMEOUT_SECONDS = 2.5
 MUTEX_NAME = r'Local\WorkPal-FortiClient-Proxy-Assistant'
 
 
@@ -81,29 +83,47 @@ def parse_proxy(server: str) -> tuple[str, int]:
     return match[1], int(match[2])
 
 
+def _resolve(host: str, port: int, timeout: float) -> list:
+    """getaddrinfo 本身不支持超时，放到守护线程中等待，避免 DNS 卡住守护循环。"""
+    result: dict = {}
+
+    def worker():
+        try:
+            result['addresses'] = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            result['error'] = exc
+
+    thread = threading.Thread(target=worker, daemon=True, name='proxy-dns')
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise TimeoutError(f'解析 {host} 超时')
+    if 'error' in result:
+        raise result['error']
+    return result['addresses']
+
+
 def probe_proxy(server: str) -> bool:
-    """有超时的 TCP 检查；异步连接同时限制 DNS 等待，不发送业务数据。"""
+    """有总超时的 TCP 检查（含 DNS），只建立连接，不发送业务数据。"""
     host, port = parse_proxy(server)
-    script = r'''
-$client = [System.Net.Sockets.TcpClient]::new()
-$ready = $false
-try {
-    $operation = $client.BeginConnect('__HOST__', __PORT__, $null, $null)
-    if ($operation.AsyncWaitHandle.WaitOne(2500)) {
-        $client.EndConnect($operation)
-        $ready = $client.Connected
-    }
-} catch {} finally { $client.Dispose() }
-$ready | ConvertTo-Json -Compress
-'''.replace('__HOST__', host).replace('__PORT__', str(port))
-    powershell = str(Path(os.environ.get('SystemRoot', r'C:\Windows')) /
-                     'System32/WindowsPowerShell/v1.0/powershell.exe')
-    result = subprocess.run(
-        [powershell, '-NoProfile', '-NonInteractive', '-Command', script],
-        capture_output=True, encoding='utf-8', errors='replace',
-        timeout=8, creationflags=subprocess.CREATE_NO_WINDOW, check=True,
-    )
-    return json.loads(result.stdout.lstrip('\ufeff')) is True
+    deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
+    try:
+        addresses = _resolve(host, port, PROBE_TIMEOUT_SECONDS)
+    except OSError as exc:
+        logger.debug('公司代理地址解析失败：%s', exc)
+        return False
+    for family, kind, protocol, _, address in addresses:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            with socket.socket(family, kind, protocol) as connection:
+                connection.settimeout(remaining)
+                connection.connect(address)
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def query_tunnel(server: str) -> TunnelStatus:
@@ -123,9 +143,36 @@ def query_tunnel(server: str) -> TunnelStatus:
     if tunnel.state == 'connected' or office:
         try:
             ready = probe_proxy(server)
-        except (OSError, subprocess.SubprocessError, ValueError):
+        except (OSError, ValueError):
             logger.warning('公司代理探测失败或超时，网卡状态=%s', tunnel.state)
     return TunnelStatus(tunnel.state, ready, office)
+
+
+@contextmanager
+def _proxy_ownership(busy_message: str, network_busy_message: str | None = None):
+    """持有代理命名互斥体；给出 network_busy_message 时同时阻止网卡切换。"""
+    import win32api
+    import win32event
+
+    mutex = win32event.CreateMutex(None, False, MUTEX_NAME)
+    try:
+        # WAIT_OBJECT_0 / WAIT_ABANDONED 都表示已取得所有权。
+        if win32event.WaitForSingleObject(mutex, 0) not in (0, 0x80):
+            raise RuntimeError(busy_message)
+        try:
+            if network_busy_message is None:
+                yield
+                return
+            if not network_change_lock.acquire(blocking=False):
+                raise RuntimeError(network_busy_message)
+            try:
+                yield
+            finally:
+                network_change_lock.release()
+        finally:
+            win32event.ReleaseMutex(mutex)
+    finally:
+        win32api.CloseHandle(mutex)
 
 
 def find_forticlient(configured: str = '') -> Path:
@@ -317,98 +364,17 @@ class VpnProxyAssistant:
         return True
 
     def _run(self, notify, *, home: bool = False, once: bool = False, refresh=None) -> None:
-        from workpal.config import CONFIG
-        import win32api
-        import win32event
-
-        mutex = None
-        acquired = False
-        network_acquired = False
-        session = None
-        flow = None
         final_message = None
         failed = False
         try:
-            mutex = win32event.CreateMutex(None, False, MUTEX_NAME)
-            acquired = win32event.WaitForSingleObject(mutex, 0) in (0, 0x80)
-            if not acquired:
-                raise RuntimeError('另一份 WorkPal 正在管理代理，请先在那一份中停止助手')
-            network_acquired = network_change_lock.acquire(blocking=False)
-            if not network_acquired:
-                raise RuntimeError('正在切换网卡，请完成后再启动代理助手；尚未修改代理')
-            server = CONFIG['vpn_proxy_server'].removeprefix('http://')
-            parse_proxy(server)
-            initial = query_tunnel(server)
-            if self._stop.is_set():
-                return
-            launch = home and not initial.ready
-            executable = find_forticlient(CONFIG.get('forticlient_path', '')) if launch else None
-            session = ProxySession(WindowsProxyStore(), backup_path(), cancelled=self._stop.is_set)
-            before = session.store.read()
-            flow = ProxyFlow(session, server, home=home)
-            flow.prepare(initial, reconnect=home)
-            if launch:
-                if not self._launch_prepared_client(session, before, executable):
-                    return
-                notify('系统代理已临时关闭；请在 FortiClient 中自行登录、连接和输入验证码')
-            if self._stop.is_set():
-                return
-            logger.info('代理守护开启：home=%s, once=%s, interval=%s', home, once, check_interval())
-            if not once:
-                notify(f'代理守护已开启，每 {check_interval()} 秒检查一次；可随时立即检查或暂停')
-            status = initial
-            immediate = not home
-            rechecks = 0
-            while not self._stop.is_set():
-                # 所有检查共用一个线程；手动点击唤醒它，不再启动并发写入。
-                message = flow.tick(status, immediate=immediate)
-                description = flow.describe(status)
-                prefix = '单次检查完成 · ' if once else '在家守护中 · ' if flow.home else '守护中 · '
-                previous_status = self.status
-                self.status = prefix + description
-                self.last_checked = time.strftime('%H:%M:%S')
-                if previous_status != self.status:
-                    logger.info('代理守护状态：%s', self.status)
-                if refresh:
-                    try:
-                        refresh()
-                    except Exception:
-                        logger.exception('刷新代理守护菜单失败')
-                if once:
+            with _proxy_ownership('另一份 WorkPal 正在管理代理，请先在那一份中停止助手',
+                                  '正在切换网卡，请完成后再启动代理助手；尚未修改代理'):
+                try:
+                    final_message = self._guard(notify, home=home, once=once, refresh=refresh)
+                finally:
+                    # 释放锁之前标记结束，此后收到的开启请求排队到下一轮。
                     with self._lock:
-                        if self._reconnect.is_set():
-                            once = False
-                        elif not self._manual_check.is_set():
-                            # 请求接收和完成判定使用同一把锁，避免承诺后丢失请求。
-                            self._finishing = True
-                    if self._finishing:
-                        final_message = '单次检查完成 · ' + (message or description)
-                        break
-                if message:
-                    notify(message)
-                elif immediate:
-                    notify(description)
-                self._wake.wait(RESUME_CHECK_SECONDS if rechecks else check_interval())
-                with self._lock:
-                    self._wake.clear()
-                    if self._stop.is_set():
-                        break
-                    immediate = self._manual_check.is_set()
-                    self._manual_check.clear()
-                    resume = self._resume_check.is_set()
-                    self._resume_check.clear()
-                    reconnect = self._reconnect.is_set()
-                    self._reconnect.clear()
-                if resume or reconnect:
-                    flow.reset_observations()
-                    rechecks = 2  # 本次 + 两次 5 秒间隔的复查，随后恢复用户间隔。
-                elif rechecks:
-                    rechecks -= 1
-                status = query_tunnel(server)
-                if self._stop.is_set():
-                    break
-                if reconnect:
-                    self._prepare_reconnect(flow, status, notify)
+                        self._finishing = True
         except ProxyOperationCancelled:
             pass
         except Exception as exc:
@@ -423,12 +389,6 @@ class VpnProxyAssistant:
                 self.status = '已暂停 · 保留当前代理'
                 final_message = '代理守护已暂停，当前代理保持不变'
             logger.info('代理守护结束：%s', self.status)
-            if acquired:
-                win32event.ReleaseMutex(mutex)
-            if mutex is not None:
-                win32api.CloseHandle(mutex)
-            if network_acquired:
-                network_change_lock.release()
             with self._lock:
                 if self._thread is threading.current_thread():
                     self._thread = None
@@ -440,6 +400,83 @@ class VpnProxyAssistant:
             if final_message:
                 # 先释放会话和线程，再通知菜单，使“开启”按钮立即重新可用。
                 notify(final_message)
+
+    def _guard(self, notify, *, home: bool, once: bool, refresh) -> str | None:
+        """持有代理和网卡锁时运行；返回结束时要通知的消息。"""
+        from workpal.config import CONFIG
+
+        server = CONFIG['vpn_proxy_server'].removeprefix('http://')
+        parse_proxy(server)
+        initial = query_tunnel(server)
+        if self._stop.is_set():
+            return
+        launch = home and not initial.ready
+        executable = find_forticlient(CONFIG.get('forticlient_path', '')) if launch else None
+        session = ProxySession(WindowsProxyStore(), backup_path(), cancelled=self._stop.is_set)
+        before = session.store.read()
+        flow = ProxyFlow(session, server, home=home)
+        flow.prepare(initial, reconnect=home)
+        if launch:
+            if not self._launch_prepared_client(session, before, executable):
+                return
+            notify('系统代理已临时关闭；请在 FortiClient 中自行登录、连接和输入验证码')
+        if self._stop.is_set():
+            return
+        logger.info('代理守护开启：home=%s, once=%s, interval=%s', home, once, check_interval())
+        if not once:
+            notify(f'代理守护已开启，每 {check_interval()} 秒检查一次；可随时立即检查或暂停')
+        status = initial
+        immediate = not home
+        rechecks = 0
+        while not self._stop.is_set():
+            # 所有检查共用一个线程；手动点击唤醒它，不再启动并发写入。
+            message = flow.tick(status, immediate=immediate)
+            description = flow.describe(status)
+            prefix = '单次检查完成 · ' if once else '在家守护中 · ' if flow.home else '守护中 · '
+            previous_status = self.status
+            self.status = prefix + description
+            self.last_checked = time.strftime('%H:%M:%S')
+            if previous_status != self.status:
+                logger.info('代理守护状态：%s', self.status)
+            if refresh:
+                try:
+                    refresh()
+                except Exception:
+                    logger.exception('刷新代理守护菜单失败')
+            if once:
+                with self._lock:
+                    if self._reconnect.is_set():
+                        once = False
+                    elif not self._manual_check.is_set():
+                        # 请求接收和完成判定使用同一把锁，避免承诺后丢失请求。
+                        self._finishing = True
+                if self._finishing:
+                    return '单次检查完成 · ' + (message or description)
+            if message:
+                notify(message)
+            elif immediate:
+                notify(description)
+            self._wake.wait(RESUME_CHECK_SECONDS if rechecks else check_interval())
+            with self._lock:
+                self._wake.clear()
+                if self._stop.is_set():
+                    break
+                immediate = self._manual_check.is_set()
+                self._manual_check.clear()
+                resume = self._resume_check.is_set()
+                self._resume_check.clear()
+                reconnect = self._reconnect.is_set()
+                self._reconnect.clear()
+            if resume or reconnect:
+                flow.reset_observations()
+                rechecks = 2  # 本次 + 两次 5 秒间隔的复查，随后恢复用户间隔。
+            elif rechecks:
+                rechecks -= 1
+            status = query_tunnel(server)
+            if self._stop.is_set():
+                break
+            if reconnect:
+                self._prepare_reconnect(flow, status, notify)
 
     def _launch_prepared_client(self, session: ProxySession, before, executable: Path) -> bool:
         """暂停发生在临时关闭之后时，撤销本次准备，不恢复更早的代理备份。"""
@@ -482,8 +519,6 @@ assistant = VpnProxyAssistant()
 def use_script_proxy() -> None:
     """一次性启用脚本、关闭手动代理；暂停守护，后续由用户自行开启。"""
     from workpal.config import CONFIG
-    import win32api
-    import win32event
 
     url = CONFIG['office_pac_url'].strip()
     parsed = urlsplit(url)
@@ -493,45 +528,21 @@ def use_script_proxy() -> None:
         raise ValueError('OFFICE_PAC_URL 必须为有效的 HTTP/HTTPS 脚本地址')
     if not assistant.stop():
         raise RuntimeError('代理守护仍在结束检查，请稍后重试；尚未切换脚本代理')
-    mutex = win32event.CreateMutex(None, False, MUTEX_NAME)
-    acquired = win32event.WaitForSingleObject(mutex, 0) in (0, 0x80)
-    network_acquired = False
-    try:
-        if not acquired:
-            raise RuntimeError('另一份 WorkPal 正在管理代理，请先停止那一份助手')
-        network_acquired = network_change_lock.acquire(blocking=False)
-        if not network_acquired:
-            raise RuntimeError('正在切换网卡，请稍后重试；尚未切换脚本代理')
+    with _proxy_ownership('另一份 WorkPal 正在管理代理，请先停止那一份助手',
+                          '正在切换网卡，请稍后重试；尚未切换脚本代理'):
         session = ProxySession(WindowsProxyStore(), backup_path())
         session.begin(resume=True)
         session.enforce(pac_url=url)
         assistant.status = '脚本代理开启 · 手动代理关闭 · 守护未开启'
         assistant.last_checked = ''
         logger.info('已启用脚本代理并关闭手动代理，守护等待用户手动开启')
-    finally:
-        if network_acquired:
-            network_change_lock.release()
-        if acquired:
-            win32event.ReleaseMutex(mutex)
-        win32api.CloseHandle(mutex)
 
 
 def restore_backup() -> None:
     """用户显式点击恢复；不在启动时自动覆盖代理。"""
-    import win32api
-    import win32event
-
     if not assistant.stop():
         raise RuntimeError('助手仍在退出，请稍后重试')
-    mutex = win32event.CreateMutex(None, False, MUTEX_NAME)
-    acquired = win32event.WaitForSingleObject(mutex, 0) in (0, 0x80)
-    try:
-        if not acquired:
-            raise RuntimeError('另一份 WorkPal 正在管理代理，请先停止那一份助手')
+    with _proxy_ownership('另一份 WorkPal 正在管理代理，请先停止那一份助手'):
         if backup_path().exists():
             ProxySession(WindowsProxyStore(), backup_path()).restore(explicit=True)
         assistant.status = '原代理已恢复'
-    finally:
-        if acquired:
-            win32event.ReleaseMutex(mutex)
-        win32api.CloseHandle(mutex)

@@ -4,7 +4,7 @@ Windows 系统托盘工具，专为需要在 WiFi 和有线网络间频繁切换
 
 ## 功能
 
-- **一键网络切换**：在 WiFi 和有线（以太网）之间切换，自动处理适配器启用/禁用和连接等待
+- **一键网络切换**：在 WiFi 和有线（以太网）之间切换，自动处理适配器启用/禁用和连接等待；WiFi 使用 Windows 已保存的配置，WorkPal 不保存 WiFi 密码
 - **保持在线**：通过 Windows API 阻止系统息屏/睡眠，并在检测到用户真实空闲超过 3 分钟时，通过 `SendInput(F15)` 可靠重置系统空闲计时器，防止 Teams 等 IM 软件将状态切换为离线；程序退出后系统自动恢复正常电源策略
 - **系统托盘常驻**：5 种状态图标实时反映当前网络和功能状态
 - **开机自启动**：可从托盘启用/禁用 Windows 任务计划自启动
@@ -80,6 +80,12 @@ Windows 系统托盘工具，专为需要在 WiFi 和有线网络间频繁切换
 python -m pip install -r requirements.txt
 ```
 
+开发、运行测试或打包时改为安装 `requirements-dev.txt`（含 pytest、PyInstaller 和图标生成依赖）：
+
+```bash
+python -m pip install -r requirements-dev.txt
+```
+
 ### 2. 配置
 
 复制 `network_config.ini.example` 并重命名为 `network_config.ini`，按注释填写：
@@ -90,9 +96,10 @@ python -m pip install -r requirements.txt
 WIFI_ADAPTER_NAME=WLAN
 ETHERNET_ADAPTER_NAME=以太网
 WIFI_SSID=your_wifi_ssid
-WIFI_PASSWORD=your_wifi_password
 ETHERNET_PROGRAM_PATH=
 ```
+
+切换到 WiFi 时使用 Windows 中已保存的 `WIFI_SSID` 配置，因此请先在 Windows 中手动连接一次该 WiFi 并保存密码。支持 WPA2、WPA3 和企业认证等 Windows 能保存的网络类型。旧配置中的 `WIFI_PASSWORD` 已不再使用，启动时会提示删除这行明文密码。
 
 ### 3. 运行（需管理员权限）
 
@@ -110,7 +117,7 @@ scripts\build_exe.bat
 scripts\build_onefile.bat
 ```
 
-每次构建输出到独立的 `dist/folder-时间-标识/` 或 `dist/onefile-时间-标识/` 目录。脚本不会关闭运行中的 WorkPal，也不会删除旧包或用户配置；构建失败后旧包仍可使用。新包仅附带 `network_config.ini.example`，私人配置需自行放到新 EXE 旁边。
+每次构建输出到独立的 `dist/folder-时间-标识/` 或 `dist/onefile-时间-标识/` 目录。脚本不会关闭运行中的 WorkPal，也不会删除旧包或用户配置；构建失败后旧包仍可使用。新包仅附带 `network_config.ini.example`，私人配置需自行放到新 EXE 旁边。EXE 的文件版本取自 `workpal/__init__.py` 中的 `__version__`；不使用 UPX 压缩，以减少杀毒软件误报。
 
 首次使用新版前请从托盘退出旧版，再运行新包。请在新包的托盘中重新启用自启动，以更新程序路径和取消旧任务的三天运行时限。
 
@@ -126,42 +133,43 @@ scripts\build_onefile.bat
 .\scripts\disable_autostart.ps1
 ```
 
-自启动任务不限制持续运行时间；设置成功后会重新检查任务状态、程序路径、参数和工作目录，失败时不会显示“已开启”。已启用的任务指向旧版本或文件不存在时，菜单显示“需更新（点击修复）”；点击即可将任务更新为当前程序。
+托盘通过任务计划 COM 接口直接读写任务，不再启动 PowerShell。自启动任务不限制持续运行时间；设置成功后会重新检查任务状态、程序路径、参数和工作目录，失败时不会显示“已开启”。已启用的任务指向旧版本或文件不存在时，菜单显示“需更新（点击修复）”；点击即可将任务更新为当前程序。
 
 ## 项目结构
 
 ```
 WorkPal/
 ├── main.py                      # 入口文件
-├── requirements.txt             # 依赖清单
+├── requirements.txt             # 运行依赖
+├── requirements-dev.txt         # 测试、打包与图标生成依赖
 ├── network_config.ini.example   # 配置模板
 ├── WorkPal.spec                 # PyInstaller 文件夹模式打包配置
 ├── WorkPal_onefile.spec         # PyInstaller 单文件模式打包配置
-├── workpal/                     # 核心包
+├── workpal/                     # 核心包（__init__.py 中的 __version__ 为唯一版本号）
 │   ├── config.py                # 配置加载
 │   ├── system.py                # 系统工具函数
 │   ├── tray.py                  # 系统托盘 UI
 │   ├── features/
-│   │   ├── autostart.py         # Windows 任务计划自启动
+│   │   ├── autostart.py         # Windows 任务计划自启动（COM 接口）
 │   │   ├── network.py           # 网络切换逻辑（wmi + psutil）
+│   │   ├── wlan.py              # Native WiFi API 只读查询 WLAN 状态和已保存配置
 │   │   ├── keep_alive.py        # 保持在线功能
 │   │   ├── vpn_proxy.py         # 代理守护及 FortiClient 状态检查
 │   │   ├── adapter_status.py    # 不依赖 WMI 的只读网卡检测
 │   │   ├── session_events.py    # Windows 唤醒/解锁事件
 │   │   ├── proxy_settings.py    # LAN 代理和持久化恢复备份
+│   │   ├── single_instance.py   # 同一用户会话单实例
 │   │   └── network_guard.py     # 网络变更互斥锁
 ├── scripts/                     # 工具脚本
 │   ├── gen_icons.py             # 图标生成（Fluent UI Icons，MIT，需联网下载）
+│   ├── build_package.ps1        # 两种打包模式共用的构建实现
 │   ├── build_exe.bat/.ps1       # 文件夹模式打包
 │   ├── build_onefile.bat/.ps1   # 单文件模式打包
+│   ├── version_resource.py      # 生成 EXE 版本信息
 │   ├── enable_autostart.ps1     # 启用开机自启
 │   └── disable_autostart.ps1    # 禁用开机自启
 ├── assets/                      # 生成的图标（不提交 git）
-└── tests/                       # 单元测试
-    ├── test_network.py
-    ├── test_keep_alive.py
-    ├── test_autostart.py
-    └── test_vpn_proxy.py
+└── tests/                       # 单元测试（系统调用全部使用替身）
 ```
 
 ## 图标说明
@@ -179,6 +187,8 @@ WorkPal/
 
 ## 运行测试
 
+需要先安装 `requirements-dev.txt`：
+
 ```bash
 python -m pytest tests/ -v
 ```
@@ -186,9 +196,9 @@ python -m pytest tests/ -v
 ## 注意事项
 
 - 切换网络适配器需要 **管理员权限**，请以管理员身份运行
-- WiFi 连接依赖 Windows `netsh wlan` 命令，需要 WLAN AutoConfig 服务运行
-- 网络切换沿用先断后连；失败后恢复原网卡状态与实际 WiFi 配置，无法完成恢复时会明确提示。切换或恢复期间不能退出程序。
-- WorkPal 使用专用 WiFi 配置名，不覆盖同名的私人网络配置；切换失败时撤销本次配置变更。
+- WiFi 状态通过 Native WiFi API 读取，连接使用 `netsh wlan connect`，均需要 WLAN AutoConfig 服务运行
+- 切到 WiFi 时先启用 WiFi 网卡并确认存在已保存配置，再禁用有线网卡；失败后恢复原网卡状态与原 WiFi 连接，无法完成恢复时会明确提示。切换或恢复期间不能退出程序。
+- WorkPal 不新增、修改或删除任何 WiFi 配置，也不读取已保存的密码。
 - 单文件打包模式（onefile）首次启动较慢，因需解压临时文件
 
 ## License
