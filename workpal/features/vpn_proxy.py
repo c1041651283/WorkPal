@@ -19,7 +19,7 @@ from workpal.features.proxy_settings import (
     ProxyOperationCancelled, ProxySession, WindowsProxyStore,
 )
 from workpal.system import get_user_data_path
-from workpal.features.network_guard import network_change_lock
+from workpal.features.network_lock import network_change_lock
 from workpal.features.adapter_status import read_adapters
 
 logger = logging.getLogger(__name__)
@@ -254,7 +254,7 @@ class ProxyFlow:
                 transitioned = self.mode != 'unavailable'
                 self.mode = 'unavailable'
                 if changed or transitioned:
-                    return '公司代理连续不可达，已临时关闭系统代理；可点击“在家连接 / 重新连接公司”重新登录'
+                    return '公司代理连续不可达，已临时关闭系统代理；可点击“在家连接公司”重新登录'
         else:
             # 网卡读取失败不是 VPN 已断开的证据。
             self.good = self.down = self.unreachable = 0
@@ -367,8 +367,8 @@ class VpnProxyAssistant:
         final_message = None
         failed = False
         try:
-            with _proxy_ownership('另一份 WorkPal 正在管理代理，请先在那一份中停止助手',
-                                  '正在切换网卡，请完成后再启动代理助手；尚未修改代理'):
+            with _proxy_ownership('另一份 WorkPal 正在管理代理，请先在那一份中暂停代理守护',
+                                  '正在切换网卡，请完成后再开启代理守护；尚未修改代理'):
                 try:
                     final_message = self._guard(notify, home=home, once=once, refresh=refresh)
                 finally:
@@ -472,6 +472,10 @@ class VpnProxyAssistant:
                 rechecks = 2  # 本次 + 两次 5 秒间隔的复查，随后恢复用户间隔。
             elif rechecks:
                 rechecks -= 1
+            latest = _configured_server(server)
+            if latest != server:
+                server = flow.server = latest
+                flow.reset_observations()
             status = query_tunnel(server)
             if self._stop.is_set():
                 break
@@ -509,6 +513,21 @@ class VpnProxyAssistant:
             notify('公司网络仍可用，保持当前连接；未关闭代理或重连 VPN')
 
 
+def _configured_server(current: str) -> str:
+    """每轮检查读取最新配置，修改配置文件后无需重新开启守护；新地址无效时沿用当前地址。"""
+    from workpal.config import CONFIG
+    server = CONFIG['vpn_proxy_server'].removeprefix('http://')
+    if server == current:
+        return current
+    try:
+        parse_proxy(server)
+    except ValueError:
+        logger.warning('VPN_PROXY_SERVER 无效（%s），继续使用 %s', server, current)
+        return current
+    logger.info('代理守护改用新的公司代理 %s', server)
+    return server
+
+
 def backup_path() -> Path:
     return Path(get_user_data_path('vpn_proxy_session.json'))
 
@@ -528,7 +547,7 @@ def use_script_proxy() -> None:
         raise ValueError('OFFICE_PAC_URL 必须为有效的 HTTP/HTTPS 脚本地址')
     if not assistant.stop():
         raise RuntimeError('代理守护仍在结束检查，请稍后重试；尚未切换脚本代理')
-    with _proxy_ownership('另一份 WorkPal 正在管理代理，请先停止那一份助手',
+    with _proxy_ownership('另一份 WorkPal 正在管理代理，请先暂停那一份的代理守护',
                           '正在切换网卡，请稍后重试；尚未切换脚本代理'):
         session = ProxySession(WindowsProxyStore(), backup_path())
         session.begin(resume=True)
@@ -536,13 +555,3 @@ def use_script_proxy() -> None:
         assistant.status = '脚本代理开启 · 手动代理关闭 · 守护未开启'
         assistant.last_checked = ''
         logger.info('已启用脚本代理并关闭手动代理，守护等待用户手动开启')
-
-
-def restore_backup() -> None:
-    """用户显式点击恢复；不在启动时自动覆盖代理。"""
-    if not assistant.stop():
-        raise RuntimeError('助手仍在退出，请稍后重试')
-    with _proxy_ownership('另一份 WorkPal 正在管理代理，请先停止那一份助手'):
-        if backup_path().exists():
-            ProxySession(WindowsProxyStore(), backup_path()).restore(explicit=True)
-        assistant.status = '原代理已恢复'

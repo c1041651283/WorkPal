@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from workpal import tray
+from tests.fake_view import FakeView
 from workpal.features import autostart, vpn_proxy as vpn
 from workpal.features.proxy_settings import ProxySession
 from tests.test_vpn_proxy import DOWN, ORIGINAL, SERVER, UP, manager_environment
@@ -115,27 +116,12 @@ def test_pause_during_reconnect_restores_immediate_previous_proxy(manager_enviro
         assert [value.flags for value in store.writes] == [3, 1, 3]
 
 
-@pytest.mark.parametrize('resource', ['missing', 'corrupt'])
-def test_source_startup_without_usable_icon_runs_tray(tmp_path, resource):
-    path = tmp_path / 'icon_default.ico'
-    if resource == 'corrupt':
-        path.write_bytes(b'not an icon')
-    with patch.object(tray, 'get_resource_path', return_value=str(path)), \
-         patch.object(tray.pystray, 'Icon') as icon, \
-         patch('workpal.features.session_events.session_events.stop'):
-        tray.initial_tray()
-    image = icon.call_args.args[1]
-    assert image.width > 0 and image.height > 0
-    assert image.getbbox() is not None
-    icon.return_value.run.assert_called_once()
-
-
 def test_outdated_autostart_menu_updates_instead_of_disabling():
     with patch.object(autostart, 'get_cached_autostart_status', return_value='outdated'), \
          patch.object(autostart, 'enable_autostart', return_value=(True, '')) as enable, \
          patch.object(autostart, 'disable_autostart') as disable:
-        assert '需更新' in tray._autostart_status_label()
-        tray._do_autostart_toggle(MagicMock())
+        assert '需更新' in tray.autostart_label(autostart.get_cached_autostart_status())
+        tray._do_autostart_toggle(FakeView())
     enable.assert_called_once()
     disable.assert_not_called()
 

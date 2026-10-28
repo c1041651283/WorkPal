@@ -1,34 +1,32 @@
-# 网络切换配置文件
-# 复制本文件为 network_config.ini，并根据实际情况修改以下配置
-# 注意：network_config.ini 已加入 .gitignore，不会提交到版本库
+# WorkPal 配置文件
+# 位置：%LOCALAPPDATA%\WorkPal\network_config.ini（重新打包后无需重填）
+# 修改：托盘 → “编辑配置文件”，在记事本中保存即自动生效
+# 格式：每行一个 KEY=值，# 开头的行是注释
 
-# WiFi网卡名称（可在"控制面板 > 网络和Internet > 网络连接"中查看）
+# ======================== 网络切换 ========================
+
+# 网卡名称：运行 netsh interface show interface，看“接口名称”一列
 WIFI_ADAPTER_NAME=WLAN
-
-# 有线网卡名称
 ETHERNET_ADAPTER_NAME=以太网
 
-# WiFi名称（SSID）- 运行下方命令查看可用WiFi: netsh wlan show networks
-# 需要先在 Windows 中手动连接一次并保存密码；WorkPal 使用已保存的配置，不需要也不保存密码
+# 要连接的 WiFi 名称（SSID）
+# 需先在 Windows 中手动连接过一次并保存密码；WorkPal 使用系统已保存的配置，不保存密码
 WIFI_SSID=your_wifi_ssid
 
-# 切换到有线时启动的程序路径（可选，如不需要可留空）
+# 切换到有线后启动的程序（如检疫客户端），填完整路径；不需要就留空
 ETHERNET_PROGRAM_PATH=
 
-# 代理守护（公司/在家均需从托盘手动开启；不会自动连接或修改 VPN）
-# 留空时查找默认安装目录；仅允许指向 FortiClient.exe
-FORTICLIENT_PATH=
-VPN_PROXY_SERVER=proxy.ricoh.co.jp:8080
+# ======================== 代理守护 ========================
+# 以下均为默认值；需要修改时删掉行首的 # 再填写
 
-# 启动 WorkPal 及“开启脚本代理”按钮使用的地址；同时关闭手动代理，守护需手动开启
-OFFICE_PAC_URL=http://proxy.psh.com.cn/proxy-psh1.pac
+# 公司固定代理，格式：主机名:端口
+# VPN_PROXY_SERVER=proxy.ricoh.co.jp:8080
 
-# 代理守护检查间隔（秒，默认 60，最小 30；也可从托盘选择 1/2/5 分钟）
-PROXY_CHECK_INTERVAL=60
+# 启动时及“开启脚本代理”按钮使用的 PAC 地址
+# OFFICE_PAC_URL=http://proxy.psh.com.cn/proxy-psh1.pac
 
-# 使用说明：
-# 1. 首先在Windows命令行中运行 "netsh interface show interface" 查看你的网卡名称
-# 2. 将上面的网卡名称填入 WIFI_ADAPTER_NAME 和 ETHERNET_ADAPTER_NAME
-# 3. 填入你的WiFi名称，并确认 Windows 已保存该 WiFi（连接过一次即可）
-# 4. 如果切换到有线时需要启动某个程序，请填入完整路径
-# 5. 需要以管理员权限运行程序才能切换网卡
+# FortiClient.exe 的完整路径；留空时查找默认安装目录
+# FORTICLIENT_PATH=
+
+# 检查间隔（秒，30–3600）；托盘“检查间隔”中的选择优先于这里
+# PROXY_CHECK_INTERVAL=60

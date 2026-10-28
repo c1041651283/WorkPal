@@ -7,14 +7,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(SPECPATH) / 'scripts'))
 from version_resource import version_info
+from qt_trim import trim
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[
-        ('assets/icon_*.ico', 'assets'),
-    ],
+    # 界面图标内嵌在 workpal/ui/glyphs.py，运行时不再读取 assets；.ico 只用作 EXE 文件图标。
+    datas=[],
     hiddenimports=[
         'wmi',
         'pywintypes',
@@ -27,9 +27,16 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # numpy 曾被 Pillow 的可选依赖带进包里（约 27MB）；界面只用到 QtCore/QtGui/QtWidgets/QtSvg。
+    excludes=[
+        'numpy', 'PIL', 'tkinter', 'pystray',
+        'PySide6.QtNetwork', 'PySide6.QtQml', 'PySide6.QtQuick', 'PySide6.QtOpenGL',
+        'PySide6.QtPdf', 'PySide6.QtSql', 'PySide6.QtDBus', 'PySide6.QtTest',
+    ],
     noarchive=False,
 )
+
+trim(a)  # 去掉用不到的 Qt 文件（软件 OpenGL、翻译、图片格式插件）
 
 pyz = PYZ(a.pure, a.zipped_data)
 
@@ -50,7 +57,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='assets/icon_default.ico',
+    icon='assets/WorkPal.ico',
     version=version_info(SPECPATH),
     uac_admin=True,
 )

@@ -27,7 +27,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $projectRoot 'network_config.ini.example') `
         -Destination (Join-Path $outputDir 'network_config.ini.example') -ErrorAction Stop
     Write-Host "打包完成: $outputDir"
-    Write-Host '分发包仅包含模板；使用时自行放入本地 network_config.ini。'
+    Write-Host '分发包仅包含模板；配置保存在 %LOCALAPPDATA%\WorkPal\network_config.ini，新 EXE 直接沿用。'
 } catch {
     Write-Error -Message $_ -ErrorAction Continue
     exit 1

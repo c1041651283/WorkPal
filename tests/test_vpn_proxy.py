@@ -5,6 +5,8 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import subprocess
+
+from tests.fake_view import FakeView
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -490,22 +492,6 @@ def test_query_office_result_and_literal_adapter_name_are_handled():
     probe.assert_called_once_with(SERVER)  # 只探测代理地址，网卡名不进入任何命令。
 
 
-def test_menu_has_manual_guard_controls_and_no_application_feature():
-    from workpal import tray
-    menu = tray._build_menu()
-    top = list(menu.items)
-    guard = next(item for item in top if item.text == '代理守护')
-    texts = [item.text for item in guard.submenu.items]
-    assert '开启定时守护' in texts
-    assert '立即检查并修复一次' in texts
-    assert '暂停守护（保留当前代理）' in texts
-    assert not any('在宅' in item.text for item in top)
-    with patch.object(vpn, 'assistant') as manager:
-        next(item for item in guard.submenu.items if item.text == '立即检查并修复一次')(MagicMock())
-        assert manager.start.call_args.kwargs['once'] is True
-        assert callable(manager.start.call_args.kwargs['refresh'])
-
-
 def test_startup_does_not_enable_guard_even_with_existing_backup(tmp_path):
     from workpal import tray
     backup = tmp_path / 'backup.json'
@@ -515,7 +501,7 @@ def test_startup_does_not_enable_guard_even_with_existing_backup(tmp_path):
          patch.object(vpn, 'backup_path', return_value=backup), \
          patch('workpal.features.session_events.session_events.start'), \
          patch('workpal.features.autostart.refresh_autostart_status_async'):
-        tray._on_tray_setup(MagicMock())
+        tray.startup(FakeView())
     manager.start.assert_not_called()
     script_proxy.assert_called_once()
 
@@ -556,7 +542,7 @@ def test_interval_menu_persists_choice_without_starting_guard(tmp_path):
     with patch.object(config, '_USER_CONFIG_FILE', settings), \
          patch.dict(config.CONFIG, {'proxy_check_interval': '60'}), \
          patch.object(vpn, 'assistant') as manager:
-        tray._interval_action(300)(MagicMock(), None)
+        tray.set_interval(FakeView(), 300)
         assert vpn.check_interval() == 300
         assert json.loads(settings.read_text(encoding='utf-8'))['proxy_check_interval'] == '300'
     manager.start.assert_not_called()
@@ -713,16 +699,6 @@ def test_active_guard_can_prepare_reconnect_without_restoring_old_settings(manag
     assert json.loads(vpn.backup_path().read_text(encoding='utf-8'))['original']['flags'] == ORIGINAL.flags
 
 
-def test_reconnect_menu_stays_enabled_while_guard_is_running():
-    from workpal import tray
-    with patch.object(vpn, 'assistant', active=True, status='守护中', last_checked='12:00:00'), \
-         patch('workpal.features.network.get_current_mode', return_value='wifi'):
-        menu = tray._build_menu()
-        guard = next(item for item in menu.items if item.text == '代理守护')
-        reconnect = next(item for item in guard.submenu.items if item.text == '在家连接 / 重新连接公司')
-        assert reconnect.enabled
-
-
 def test_menu_refresh_does_not_call_wmi_or_netsh():
     from workpal import tray
     from workpal.features import adapter_status
@@ -730,7 +706,7 @@ def test_menu_refresh_does_not_call_wmi_or_netsh():
     with patch.dict('workpal.config.CONFIG', {'wifi_adapter_name': 'TestWiFi'}), \
          patch.object(adapter_status, 'read_adapters', return_value=[wifi]), \
          patch('workpal.features.network.get_current_mode') as old_query:
-        assert 'WiFi' in tray._network_menu_label(None)
+        assert tray.current_state().mode == 'wifi'
     old_query.assert_not_called()
 
 
