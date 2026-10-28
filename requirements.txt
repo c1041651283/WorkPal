@@ -1,6 +1,5 @@
 # 运行依赖；开发、测试与打包工具见 requirements-dev.txt
-pystray~=0.19.5
-pillow~=10.4.0
+PySide6-Essentials~=6.12
 wmi~=1.5.1
 psutil~=6.0.0
 pywin32~=311.0

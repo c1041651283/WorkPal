@@ -25,9 +25,12 @@ import psutil
 
 from workpal.config import CONFIG
 from workpal.features import wlan
-from workpal.features.network_guard import network_change_lock
+from workpal.features.network_lock import network_change_lock
 
 logger = logging.getLogger(__name__)
+
+# network_config.ini.example 中的占位值，视同未填写。
+SSID_PLACEHOLDER = 'your_wifi_ssid'
 
 # 线程本地 WMI 连接（每个线程独立初始化，避免 CoInitialize 错误）
 _thread_local = threading.local()
@@ -87,6 +90,15 @@ def _get_wmi_adapter(adapter_name: str):
     except Exception as e:
         logger.error(f"查询网卡 [{adapter_name}] 失败: {e}")
         return None
+
+
+def list_adapter_names() -> list[str]:
+    """返回“网络连接”中的全部网卡名称（含已禁用的），用于提示用户修改配置。"""
+    try:
+        return sorted(a.NetConnectionID for a in _get_wmi().Win32_NetworkAdapter() if a.NetConnectionID)
+    except Exception:
+        logger.exception('列出网卡名称失败')
+        return []
 
 
 def get_adapter_status(adapter_name: str) -> str:
@@ -345,7 +357,7 @@ def _serialize_network_change(action):
     @wraps(action)
     def guarded(*args, **kwargs):
         if not network_change_lock.acquire(blocking=False):
-            return False, '网络切换或 FortiClient 代理助手正在运行，未改变网卡'
+            return False, '网络切换或代理守护正在运行，未改变网卡'
         try:
             return action(*args, **kwargs)
         finally:
@@ -367,6 +379,13 @@ class NetworkSnapshot:
 def _capture_network_state() -> NetworkSnapshot:
     wifi, ethernet = CONFIG['wifi_adapter_name'], CONFIG['ethernet_adapter_name']
     wifi_status, ethernet_status = get_adapter_status(wifi), get_adapter_status(ethernet)
+    for name, status, key in ((wifi, wifi_status, 'WIFI_ADAPTER_NAME'),
+                              (ethernet, ethernet_status, 'ETHERNET_ADAPTER_NAME')):
+        if status == 'not_found':
+            names = list_adapter_names()
+            existing = f'；本机网卡：{"、".join(names)}' if names else ''
+            raise RuntimeError(f'找不到网卡「{name}」，请右键托盘 →“编辑配置文件”修改 {key}'
+                               f'{existing}；未开始切换')
     known = {'disabled', 'enabled_connected', 'enabled_disconnected'}
     if wifi_status not in known or ethernet_status not in known:
         raise RuntimeError('无法确认网卡原状态，未开始切换')
@@ -413,15 +432,15 @@ def _restore_network(snapshot: NetworkSnapshot, attempted_wifi: bool = False) ->
 def _switch_network(target: str) -> tuple:
     from workpal.features.vpn_proxy import assistant
     if assistant.active:
-        return False, 'FortiClient 代理助手正在运行，为保护 VPN 连接，未切换网卡；请先停止助手'
+        return False, '代理守护正在运行，为保护 VPN 连接，未切换网卡；请先暂停守护'
     ssid = CONFIG['wifi_ssid']
-    missing_profile = f'Windows 中没有 WiFi「{ssid}」的已保存配置，请先手动连接一次'
+    missing_profile = f'Windows 中没有 WiFi「{ssid}」的已保存配置，请先在 Windows 中手动连接一次并保存密码'
     profile, attempted_wifi = None, False
     try:
         snapshot = _capture_network_state()
         if target == 'wifi':
-            if not ssid:
-                raise RuntimeError('WiFi 名称未配置，未开始切换')
+            if not ssid or ssid == SSID_PLACEHOLDER:
+                raise RuntimeError('尚未填写要连接的 WiFi：请右键托盘 →“编辑配置文件”填写 WIFI_SSID；未开始切换')
             # 网卡已禁用时无法列出配置，启用网卡后再查，失败照常回滚。
             if snapshot.wifi_adapter != 'disabled':
                 profile = find_saved_profile(snapshot.wifi_name, ssid)

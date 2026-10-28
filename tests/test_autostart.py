@@ -40,16 +40,16 @@ def test_build_launch_target_for_source_run():
 def test_tray_autostart_toggle_reports_success():
     from workpal import tray
     from workpal.features import autostart
-    from unittest.mock import MagicMock
+    from tests.fake_view import FakeView
 
     autostart._set_cached_status(autostart.STATUS_DISABLED)
     with patch('workpal.features.autostart.enable_autostart', return_value=(True, '')) as enable:
-        real_icon = MagicMock()
-        tray._do_autostart_toggle(real_icon)
+        view = FakeView()
+        tray._do_autostart_toggle(view)
 
     enable.assert_called_once()
-    real_icon.notify.assert_called_once()
-    assert '已启用' in real_icon.notify.call_args.kwargs['message']
+    assert len(view.notes) == 1
+    assert '已启用' in view.last.message and view.last.level == 'success'
 
 
 def test_tray_autostart_label_uses_cached_status_without_scheduler_query():
@@ -61,4 +61,5 @@ def test_tray_autostart_label_uses_cached_status_without_scheduler_query():
         'workpal.features.autostart.is_enabled',
         side_effect=AssertionError('menu must not query task scheduler synchronously'),
     ):
-        assert tray._autostart_status_label(None) == '开机自动启动：已开启'
+        assert tray.current_state().autostart == 'enabled'
+        assert tray.autostart_label('enabled') == '已开启'

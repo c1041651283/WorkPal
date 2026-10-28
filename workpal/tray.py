@@ -1,27 +1,28 @@
 """
 workpal/tray.py
-系统托盘入口。
+托盘的业务动作，与界面无关。
 
-改进点：
-  - 网络切换在后台线程执行，不阻塞托盘
-  - threading.Lock 防止重入
-  - 动态菜单标签显示当前网络模式
-  - 5 种图标随状态自动切换
-  - 通知附带失败原因
+界面（workpal/ui）实现 View 协议：notify 显示通知卡片，refresh 重新读取状态，quit 退出程序。
+所有耗时操作在后台线程执行，View 的实现负责把调用转到界面线程。
+  - threading.Lock 防止网络切换、代理操作重入
+  - current_state() 汇总界面需要显示的全部状态
 """
 
-import functools
+import os
+import subprocess
+import sys
 import threading
+import time
 import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Protocol
 
-import pystray
-from pystray import Menu, MenuItem as Item
-from PIL import Image, ImageDraw, UnidentifiedImageError
-
-import workpal.features.network as network
-import workpal.features.keep_alive as keep_alive
-from workpal import __version__
-from workpal.system import get_resource_path
+from workpal import __version__, config
+from workpal.features import (
+    adapter_status, autostart, keep_alive, network, session_events, tray_promotion, vpn_proxy,
+)
+from workpal.system import get_user_data_path, is_frozen
 
 logger = logging.getLogger(__name__)
 
@@ -31,137 +32,188 @@ VERSION = f'v{__version__}'
 # 防止网络切换重入
 _switch_lock = threading.Lock()
 _autostart_lock = threading.Lock()
-# 网络切换线程运行期间显示“切换中”图标
+# 网络切换线程运行期间显示“切换中”，并记住切换目标
 _switching = False
+_switch_target: str | None = None
+# 退出时通知后台线程（如托盘显示设置）结束
+_stop_event = threading.Event()
 
-# 全局图标引用（供其他模块发送通知）
-_icon_ref: pystray.Icon | None = None
+# 记事本保存配置后自动重新加载：新版记事本会立即返回，不能靠等待进程退出判断
+CONFIG_WATCH_SECONDS = 30 * 60
+CONFIG_POLL_SECONDS = 1.0
+_config_watch_lock = threading.Lock()
+_config_watch_until = 0.0
+_config_watcher: threading.Thread | None = None
+
+INTERVAL_CHOICES = (60, 120, 300)
 
 
-def notify(title: str, message: str) -> None:
-    """向系统托盘发送通知（可从其他模块调用）。"""
-    if _icon_ref is not None:
-        try:
-            _icon_ref.notify(title=title, message=message)
-        except Exception as exc:
-            logger.warning(f'托盘通知失败: {exc}')
-    else:
-        logger.info(f'[通知] {title}: {message}')
+class View(Protocol):
+    def notify(self, title: str, message: str = '', *, level: str = 'info',
+               key: str | None = None) -> None:
+        """显示通知；同一 key 的通知原地更新。level：info/success/error/progress。"""
 
-# 图标资源路径映射
-_ICON_PATHS = {
-    'default':   'assets/icon_default.ico',
-    'wifi':      'assets/icon_wifi.ico',
-    'ethernet':  'assets/icon_ethernet.ico',
-    'switching': 'assets/icon_switching.ico',
-    'alive':     'assets/icon_alive.ico',
+    def refresh(self) -> None:
+        """重新读取 current_state()，更新图标、悬停提示和菜单。"""
+
+    def quit(self) -> None:
+        """结束界面事件循环。"""
+
+
+@dataclass(frozen=True)
+class TrayState:
+    mode: str                 # wifi / ethernet / unknown
+    switching: bool
+    switch_target: str | None
+    keep_alive: bool
+    guard_active: bool
+    guard_status: str
+    last_checked: str
+    interval: int
+    autostart: str            # enabled / disabled / outdated / checking / failed / unknown
+
+
+_MODE_NAMES = {'wifi': 'WiFi', 'ethernet': '有线'}
+# 代理守护的提示文字来自 vpn_proxy，含这些词时按错误样式显示
+_ERROR_WORDS = ('失败', '无法', '不可达', '未找到', '已停止', '错误')
+_AUTOSTART_LABELS = {
+    'enabled': '已开启',
+    'disabled': '已关闭',
+    'outdated': '需更新',
+    'checking': '检测中',
+    'failed': '检测失败',
+    'unknown': '检测中',
 }
 
 
-@functools.lru_cache(maxsize=None)
-def _load_icon(name: str) -> Image.Image:
-    path = get_resource_path(_ICON_PATHS.get(name, _ICON_PATHS['default']))
+def current_state() -> TrayState:
+    assistant = vpn_proxy.assistant
     try:
-        with Image.open(path) as image:
-            return image.convert('RGBA')
-    except (OSError, UnidentifiedImageError):
-        logger.warning('图标不可用，使用内置备用图标：%s', path)
-        colors = {'default': '#3c3c3c', 'wifi': '#1a73e8', 'ethernet': '#0f9d58',
-                  'switching': '#f29900', 'alive': '#7b3fa0'}
-        image = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(image)
-        draw.rounded_rectangle((2, 2, 61, 61), radius=12,
-                               fill=colors.get(name, colors['default']))
-        draw.line([(13, 19), (22, 45), (32, 28), (42, 45), (51, 19)],
-                  fill='white', width=5)
-        return image
-
-
-def _set_icon(icon: pystray.Icon, name: str) -> None:
-    try:
-        icon.icon = _load_icon(name)
-    except Exception as e:
-        logger.warning(f"切换图标失败 [{name}]: {e}")
-
-
-def _refresh_icon(icon: pystray.Icon, mode: str | None = None) -> None:
-    """按“切换中 > 保持在线 > 网络模式”的优先级统一计算图标。"""
-    if _switching:
-        name = 'switching'
-    elif keep_alive.is_active():
-        name = 'alive'
-    else:
-        mode = mode or _current_network_mode()
-        name = mode if mode in ('wifi', 'ethernet') else 'default'
-    _set_icon(icon, name)
-
-
-# ---------------------------------------------------------------------------
-# 菜单回调
-# ---------------------------------------------------------------------------
-
-def _on_about(icon: pystray.Icon, item) -> None:
-    icon.notify(
-        title=f'关于 {APP_NAME}',
-        message=f'{APP_NAME} {VERSION}\n本软件仅供个人学习使用。',
+        autostart_status = autostart.get_cached_autostart_status()
+    except Exception:
+        autostart_status = 'failed'
+    return TrayState(
+        mode=_current_network_mode(),
+        switching=_switching,
+        switch_target=_switch_target,
+        keep_alive=keep_alive.is_active(),
+        guard_active=assistant.active,
+        guard_status=assistant.status,
+        last_checked=assistant.last_checked,
+        interval=vpn_proxy.check_interval(),
+        autostart=autostart_status,
     )
 
 
-def _on_quit(icon: pystray.Icon, item) -> None:
-    """停止代理守护最多等待 20 秒，放到后台线程，避免托盘无响应。"""
+def icon_name(state: TrayState) -> str:
+    """托盘图标的主体：切换中 > 网络模式；保持在线另用角标表示，不再盖住网络状态。"""
+    if state.switching:
+        return 'switching'
+    return state.mode if state.mode in ('wifi', 'ethernet') else 'unknown'
+
+
+def mode_name(mode: str) -> str:
+    return _MODE_NAMES.get(mode, '未识别')
+
+
+def autostart_label(status: str) -> str:
+    return _AUTOSTART_LABELS.get(status, '检测中')
+
+
+def target_name(target: str | None) -> str:
+    """切换目标在提示中的叫法。"""
+    return 'WiFi' if target == 'wifi' else '有线网络'
+
+
+def is_error_message(text: str) -> bool:
+    return any(word in text for word in _ERROR_WORDS)
+
+
+def tooltip(state: TrayState) -> str:
+    """鼠标悬停时显示的状态；Windows 限制 127 个字符。"""
+    network_name = '切换中' if state.switching else mode_name(state.mode)
+    alive = '开' if state.keep_alive else '关'
+    text = f'{APP_NAME} {VERSION}\n网络：{network_name}　保持在线：{alive}\n代理：{state.guard_status}'
+    return text[:127]
+
+
+def _current_network_mode() -> str:
+    """状态刷新只读 IP Helper，不调用可能阻塞的 WMI/netsh。"""
+    mode = 'unknown'
+    try:
+        connected = {x['friendly_name'] for x in adapter_status.read_adapters() if x['status'] == 2}
+        if config.CONFIG['wifi_adapter_name'] in connected:
+            mode = 'wifi'
+        elif config.CONFIG['ethernet_adapter_name'] in connected:
+            mode = 'ethernet'
+    except OSError:
+        logger.debug('无法读取网络状态', exc_info=True)
+    return mode
+
+
+# ---------------------------------------------------------------------------
+# 一般操作
+# ---------------------------------------------------------------------------
+
+def open_logs(view: View) -> None:
+    try:
+        os.startfile(get_user_data_path())
+    except OSError as exc:
+        view.notify('打开日志文件夹失败', str(exc), level='error')
+
+
+def quit_app(view: View) -> None:
+    """停止代理守护最多等待 20 秒，放到后台线程，避免界面无响应。"""
     if not _switch_lock.acquire(blocking=False):
-        icon.notify(title='请稍候', message='正在切换或恢复网络，完成后再退出')
+        view.notify('请稍候', '正在切换或恢复网络，完成后再退出')
         return
-    threading.Thread(target=_quit_and_release, args=(icon,), daemon=True,
+    threading.Thread(target=_quit_and_release, args=(view,), daemon=True,
                      name='quit').start()
 
 
-def _quit_and_release(icon: pystray.Icon) -> None:
+def _quit_and_release(view: View) -> None:
     try:
-        _quit_when_idle(icon)
+        _quit_when_idle(view)
     except Exception:
         logger.exception('退出失败')
-        icon.notify(title='退出失败', message='请查看日志后重试')
+        view.notify('退出失败', '请查看日志后重试', level='error')
     finally:
         _switch_lock.release()
 
 
-def _quit_when_idle(icon: pystray.Icon) -> None:
-    from workpal.features.vpn_proxy import assistant
-    if not assistant.stop():
-        icon.notify(title='请稍候', message='正在停止代理检查，请稍后再次退出')
+def _quit_when_idle(view: View) -> None:
+    if not vpn_proxy.assistant.stop():
+        view.notify('请稍候', '正在停止代理检查，请稍后再次退出')
         return
     keep_alive.toggle_keep_alive(False)
-    from workpal.features.session_events import session_events
-    session_events.stop()
-    # icon.run() 返回后由 main() 释放单实例并正常退出。
-    icon.stop()
+    _stop_event.set()
+    session_events.session_events.stop()
+    # 界面事件循环结束后由 main() 释放单实例并正常退出。
+    view.quit()
 
 
-def _on_autostart_toggle(icon: pystray.Icon, item) -> None:
-    """后台启用/禁用开机自启动，避免阻塞托盘线程。"""
+def toggle_autostart(view: View) -> None:
+    """后台启用/禁用开机自启动，避免阻塞界面。"""
     if not _autostart_lock.acquire(blocking=False):
-        icon.notify(title='开机自动启动', message='正在处理，请稍候…')
+        view.notify('开机自动启动', '正在处理，请稍候…', key='autostart')
         return
     threading.Thread(
         target=_do_autostart_toggle,
-        args=(icon,),
+        args=(view,),
         daemon=True,
         name='autostart-toggle',
     ).start()
 
 
-def _do_autostart_toggle(icon: pystray.Icon) -> None:
+def _do_autostart_toggle(view: View) -> None:
     try:
-        from workpal.features import autostart
-
         status = autostart.get_cached_autostart_status()
         if status in (
             autostart.STATUS_UNKNOWN,
             autostart.STATUS_CHECKING,
             autostart.STATUS_FAILED,
         ):
-            icon.notify(title='开机自动启动', message='正在确认当前状态，请稍候…')
+            view.notify('开机自动启动', '正在确认当前状态，请稍候…', level='progress', key='autostart')
             autostart.refresh_autostart_status_async(wait=True)
             status = autostart.get_cached_autostart_status()
 
@@ -173,308 +225,243 @@ def _do_autostart_toggle(icon: pystray.Icon) -> None:
             message = ('已更新自启动为当前程序' if status == autostart.STATUS_OUTDATED
                        else '已启用开机自动启动') if success else f'启用失败：{reason}'
 
-        title = '开机自动启动 ✓' if success else '开机自动启动失败 ✗'
-        icon.notify(title=title, message=message)
-        icon.update_menu()
+        view.notify('开机自动启动', message, level='success' if success else 'error', key='autostart')
+        view.refresh()
     finally:
         if _autostart_lock.locked():
             _autostart_lock.release()
 
 
-def _autostart_status_label(item=None) -> str:
+def edit_config(view: View) -> None:
+    """用记事本打开配置文件；每次保存都自动重新加载，无需重启 WorkPal。"""
+    global _config_watch_until, _config_watcher
     try:
-        from workpal.features import autostart
-        status = autostart.get_cached_autostart_status()
-    except Exception:
-        status = 'failed'
+        path = config.prepare_config_file(create=True)
+        notepad = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'notepad.exe'
+        subprocess.Popen([str(notepad), str(path)])
+    except Exception as exc:
+        logger.exception('打开配置文件失败')
+        view.notify('打开配置文件失败', str(exc), level='error')
+        return
+    with _config_watch_lock:
+        # 再次点击只延长监听时间，不重复启动线程。
+        _config_watch_until = time.monotonic() + CONFIG_WATCH_SECONDS
+        if _config_watcher is None or not _config_watcher.is_alive():
+            _config_watcher = threading.Thread(target=_watch_config, args=(view, path),
+                                               daemon=True, name='config-watch')
+            _config_watcher.start()
 
-    labels = {
-        'enabled': '已开启',
-        'disabled': '已关闭',
-        'outdated': '需更新（点击修复）',
-        'checking': '检测中',
-        'failed': '失败',
-        'unknown': '检测中',
-    }
-    return f'开机自动启动：{labels.get(status, "检测中")}'
+
+def _read_bytes(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
 
 
-def _on_keep_alive(icon: pystray.Icon, item) -> None:
-    """切换保持在线状态。"""
+def _watch_config(view: View, path: Path) -> None:
+    global _config_watcher
+    last = _read_bytes(path)
+    while True:
+        time.sleep(CONFIG_POLL_SECONDS)
+        current = _read_bytes(path)
+        if current is not None and current != last:
+            last = current
+            _reload_config(view)
+        with _config_watch_lock:
+            if time.monotonic() >= _config_watch_until:
+                _config_watcher = None
+                return
+
+
+def _reload_config(view: View) -> None:
+    try:
+        config.reload_config()
+        view.notify('配置文件', '已保存，新配置已生效', level='success', key='config')
+        view.refresh()
+    except Exception as exc:
+        logger.exception('重新加载配置文件失败')
+        view.notify('重新加载配置失败', str(exc), level='error', key='config')
+
+
+def toggle_keep_alive(view: View) -> None:
     new_state = not keep_alive.is_active()
     keep_alive.toggle_keep_alive(new_state)
-    _refresh_icon(icon)
-
+    view.refresh()
     if new_state:
-        icon.notify(title='保持在线状态', message='✓ 已开启，将定期模拟按键防止空闲')
+        view.notify('保持在线已开启', '用户空闲时会定期模拟按键，防止显示离开', level='success',
+                    key='keep-alive')
     else:
-        icon.notify(title='保持在线状态', message='已关闭')
-
-    icon.update_menu()
+        view.notify('保持在线已关闭', key='keep-alive')
 
 
-def _current_network_mode() -> str:
-    """托盘刷新只读 IP Helper，不调用可能阻塞的 WMI/netsh。"""
-    from workpal.config import CONFIG
-    from workpal.features.adapter_status import read_adapters
-    mode = 'unknown'
-    try:
-        connected = {x['friendly_name'] for x in read_adapters() if x['status'] == 2}
-        if CONFIG['wifi_adapter_name'] in connected:
-            mode = 'wifi'
-        elif CONFIG['ethernet_adapter_name'] in connected:
-            mode = 'ethernet'
-    except OSError:
-        logger.debug('无法更新网络菜单标签', exc_info=True)
-    return mode
+# ---------------------------------------------------------------------------
+# 网络切换
+# ---------------------------------------------------------------------------
+
+def switch_network(view: View, target: str | None = None) -> None:
+    """target 为空时按当前网络切到另一种；无法识别时由后台线程再判断一次。"""
+    if target is None:
+        target = {'wifi': 'ethernet', 'ethernet': 'wifi'}.get(_current_network_mode())
+    _start_switch(view, target)
 
 
-def _network_menu_label(item) -> str:
-    mode = _current_network_mode()
-    labels = {'wifi': 'WiFi ✓', 'ethernet': '有线 ✓', 'unknown': '未知'}
-    return f'网络切换  [{labels.get(mode, "?")}]'
-
-
-def _on_switch_network(icon: pystray.Icon, item) -> None:
-    """菜单回调：非阻塞，立即返回，切换在后台线程执行。"""
+def _start_switch(view: View, target: str | None) -> None:
+    """立即返回，切换在后台线程执行。"""
     if not _switch_lock.acquire(blocking=False):
-        icon.notify(title='网络切换', message='⏳ 正在切换中，请稍候...')
+        view.notify('请稍候', '正在切换网络或代理', key='network')
         return
     threading.Thread(
         target=_do_switch_and_release,
-        args=(icon,),
+        args=(view, target),
         daemon=True,
         name='network-switch',
     ).start()
 
 
-def _do_switch_and_release(icon: pystray.Icon) -> None:
-    """后台线程：执行切换，完成后释放锁并更新图标。"""
-    global _switching
-    new_mode = None
+def _do_switch_and_release(view: View, target: str | None = None) -> None:
+    """后台线程：执行切换，完成后释放锁并刷新界面。target 为空时按当前网络切到另一种。"""
+    global _switching, _switch_target
     try:
-        current_mode = network.get_current_mode()
-        logger.info(f"触发网络切换，当前模式: {current_mode}")
-        _switching = True
-        _refresh_icon(icon)
+        if target is None:
+            current_mode = network.get_current_mode()
+            logger.info(f"触发网络切换，当前模式: {current_mode}")
+            target = {'wifi': 'ethernet', 'ethernet': 'wifi'}.get(current_mode)
+            if target is None:
+                view.notify('无法识别当前网络', '请在菜单的网络卡片中选择切换到 WiFi 或有线',
+                            level='error', key='network')
+                return
+        _switching, _switch_target = True, target
+        view.refresh()
+        name = target_name(target)
 
-        if current_mode == 'wifi':
-            icon.notify(title='网络切换', message='正在切换到有线网络...')
-            success, reason = network.switch_to_ethernet()
-            if success:
-                new_mode = 'ethernet'
-                icon.notify(title='网络切换', message='✓ 已切换到有线网络')
-            else:
-                icon.notify(title='网络切换', message=f'✗ 切换失败：{reason}')
+        # 代理守护运行时会锁住网卡；先切回脚本代理（同时暂停守护）再切换。
+        detail = ''
+        if vpn_proxy.assistant.active:
+            try:
+                vpn_proxy.use_script_proxy()
+            except Exception as exc:
+                logger.exception('切换网络前切回脚本代理失败')
+                view.notify('未切换网络', f'切回脚本代理失败：{exc}', level='error', key='network')
+                return
+            detail = '已暂停代理守护并切回脚本代理'
 
-        elif current_mode == 'ethernet':
-            icon.notify(title='网络切换', message='正在切换到 WiFi...')
-            success, reason = network.switch_to_wifi()
-            if success:
-                new_mode = 'wifi'
-                icon.notify(title='网络切换', message='✓ 已切换到 WiFi')
-            else:
-                icon.notify(title='网络切换', message=f'✗ 切换失败：{reason}')
-
+        view.notify(f'正在切换到{name}', detail, level='progress', key='network')
+        switch = network.switch_to_wifi if target == 'wifi' else network.switch_to_ethernet
+        success, reason = switch()
+        if success:
+            view.notify(f'已切换到{name}', detail, level='success', key='network')
         else:
-            icon.notify(title='网络切换', message='✗ 无法识别当前网络状态，请手动检查')
-
-        icon.update_menu()
+            view.notify('切换失败', reason, level='error', key='network')
     except Exception as e:
-        logger.error(f"网络切换异常: {e}")
-        icon.notify(title='错误', message=f'程序异常: {e}')
+        logger.exception('网络切换异常')
+        view.notify('程序异常', str(e), level='error', key='network')
     finally:
-        _switching = False
-        _refresh_icon(icon, new_mode)
+        _switching, _switch_target = False, None
         _switch_lock.release()
+        view.refresh()
 
 
-def _vpn_status_label(item=None) -> str:
-    from workpal.features.vpn_proxy import assistant
-    checked = f'（检查于 {assistant.last_checked}）' if assistant.last_checked else ''
-    return assistant.status + checked
+# ---------------------------------------------------------------------------
+# 代理守护
+# ---------------------------------------------------------------------------
+
+def start_guard(view: View) -> None:
+    _start_proxy_guard(view)
 
 
-def _on_proxy_guard_start(icon: pystray.Icon, item) -> None:
-    _start_proxy_guard(icon)
+def check_now(view: View) -> None:
+    _start_proxy_guard(view, once=True)
 
 
-def _on_proxy_check(icon: pystray.Icon, item) -> None:
-    _start_proxy_guard(icon, once=True)
+def connect_home(view: View) -> None:
+    _start_proxy_guard(view, home=True)
 
 
-def _interval_action(seconds: int):
-    def action(icon, item):
-        from workpal.config import set_config_value
-        try:
-            set_config_value('proxy_check_interval', str(seconds))
-            _vpn_notify(icon, f'检查间隔已设为 {seconds // 60} 分钟，下次检查后使用新间隔')
-        except Exception as exc:
-            _vpn_notify(icon, f'保存检查间隔失败：{exc}')
-    return action
+def set_interval(view: View, seconds: int) -> None:
+    try:
+        config.set_config_value('proxy_check_interval', str(seconds))
+        _vpn_notify(view, f'检查间隔已设为 {seconds // 60} 分钟，下次检查后使用新间隔')
+    except Exception as exc:
+        _vpn_notify(view, f'保存检查间隔失败：{exc}')
 
 
-def _interval_checked(seconds: int):
-    def checked(item):
-        from workpal.features.vpn_proxy import check_interval
-        return check_interval() == seconds
-    return checked
-
-
-def _on_vpn_start(icon: pystray.Icon, item) -> None:
-    _start_proxy_guard(icon, home=True)
-
-
-def _start_proxy_guard(icon: pystray.Icon, *, home=False, once=False) -> None:
-    from workpal.features.vpn_proxy import assistant
+def _start_proxy_guard(view: View, *, home=False, once=False) -> None:
     if not _switch_lock.acquire(blocking=False):
-        _vpn_notify(icon, '正在切换网络或代理，请完成后再开启检查')
+        _vpn_notify(view, '正在切换网络或代理，请完成后再开启检查')
         return
     try:
-        assistant.start(lambda message: _vpn_notify(icon, message),
-                        home=home, once=once, refresh=icon.update_menu)
+        vpn_proxy.assistant.start(lambda message: _vpn_notify(view, message),
+                        home=home, once=once, refresh=view.refresh)
     finally:
         _switch_lock.release()
 
 
-def _on_script_proxy(icon: pystray.Icon, item) -> None:
+def use_script(view: View) -> None:
     if not _switch_lock.acquire(blocking=False):
-        _vpn_notify(icon, '正在切换网络或代理，请稍候')
+        _vpn_notify(view, '正在切换网络或代理，请稍候')
         return
-    threading.Thread(target=_do_script_proxy, args=(icon,), daemon=True,
+    threading.Thread(target=_do_script_proxy, args=(view,), daemon=True,
                      name='script-proxy').start()
 
 
-def _do_script_proxy(icon: pystray.Icon) -> None:
-    """调用方持有切换锁，避免刚切到脚本又被并发开启的守护覆盖。"""
-    from workpal.features.vpn_proxy import use_script_proxy
+def _do_script_proxy(view: View, *, notify_success: bool = True) -> None:
+    """调用方持有切换锁，避免刚切到脚本又被并发开启的守护覆盖。启动时只在失败时通知。"""
     try:
-        use_script_proxy()
-        _vpn_notify(icon, '脚本代理已开启、手动代理已关闭；需要时可手动开启代理守护')
+        vpn_proxy.use_script_proxy()
+        if notify_success:
+            _vpn_notify(view, '脚本代理已开启、手动代理已关闭；需要时可手动开启代理守护')
+        else:
+            view.refresh()
     except Exception as exc:
         logger.exception('切换脚本代理失败')
-        _vpn_notify(icon, f'切换脚本代理失败：{exc}')
+        _vpn_notify(view, f'切换脚本代理失败：{exc}')
     finally:
         _switch_lock.release()
 
 
-def _vpn_notify(icon: pystray.Icon, message: str) -> None:
-    notify('代理守护', message)
+def _vpn_notify(view: View, message: str) -> None:
+    level = 'error' if is_error_message(message) else 'info'
+    view.notify('代理守护', message, level=level, key='proxy')
     try:
-        icon.update_menu()
+        view.refresh()
     except Exception:
-        logger.exception('更新代理助手菜单失败')
+        logger.exception('刷新代理守护状态失败')
 
 
-def _on_vpn_stop(icon: pystray.Icon, item) -> None:
-    from workpal.features.vpn_proxy import assistant
-
+def stop_guard(view: View) -> None:
     def worker():
-        if not assistant.stop():
-            _vpn_notify(icon, '助手仍在结束状态查询，请稍候；没有操作 VPN 连接')
-        icon.update_menu()
+        if not vpn_proxy.assistant.stop():
+            _vpn_notify(view, '代理守护仍在结束状态查询，请稍候；没有操作 VPN 连接')
+        view.refresh()
 
     threading.Thread(target=worker, daemon=True, name='vpn-proxy-stop').start()
 
 
-def _on_vpn_restore(icon: pystray.Icon, item) -> None:
-    from workpal.features.vpn_proxy import restore_backup
-    if not _switch_lock.acquire(blocking=False):
-        _vpn_notify(icon, '正在切换网络或代理，请稍候再恢复')
-        return
-
-    def worker():
-        try:
-            restore_backup()
-            _vpn_notify(icon, '已恢复接管前的代理，FortiClient 配置和连接没有改变')
-        except Exception as exc:
-            _vpn_notify(icon, f'恢复失败：{exc}')
-        finally:
-            _switch_lock.release()
-
-    threading.Thread(target=worker, daemon=True, name='vpn-proxy-restore').start()
-
-
-def _vpn_active(item=None) -> bool:
-    from workpal.features.vpn_proxy import assistant
-    return assistant.active
-
-
-def _build_menu() -> Menu:
-    """构造托盘菜单；独立成函数便于测试 pystray 回调签名。"""
-    return Menu(
-        Item(
-            '保持在线状态',
-            action=_on_keep_alive,
-            checked=lambda item: keep_alive.is_active(),
-        ),
-        Item(
-            _network_menu_label,
-            action=_on_switch_network,
-        ),
-        Item('代理守护', Menu(
-            Item(_vpn_status_label, action=None, enabled=False),
-            Item('开启脚本代理（关闭手动代理）', action=_on_script_proxy),
-            Item('开启定时守护', action=_on_proxy_guard_start,
-                 enabled=lambda item: not _vpn_active()),
-            Item('立即检查并修复一次', action=_on_proxy_check),
-            Item('检查间隔', Menu(*(
-                Item(f'{seconds // 60} 分钟', action=_interval_action(seconds),
-                     checked=_interval_checked(seconds), radio=True)
-                for seconds in (60, 120, 300)
-            ))),
-            Item('在家连接 / 重新连接公司', action=_on_vpn_start),
-            Item('暂停守护（保留当前代理）', action=_on_vpn_stop, enabled=_vpn_active),
-            Item('恢复接管前的代理', action=_on_vpn_restore),
-        )),
-        Menu.SEPARATOR,
-        Item(
-            _autostart_status_label,
-            action=_on_autostart_toggle,
-        ),
-        Item('帮助', Menu(
-            Item('关于本软件', action=_on_about),
-            Item(f'版本: {VERSION}', action=None, enabled=False),
-        )),
-        Item('退出', _on_quit),
-    )
-
-
 # ---------------------------------------------------------------------------
-# 初始化
+# 启动
 # ---------------------------------------------------------------------------
 
-def _on_tray_setup(icon: pystray.Icon) -> None:
-    """启动时只设置脚本代理，不自动开启守护或检疫流程。"""
+def startup(view: View) -> None:
+    """界面显示后在后台线程调用：设置脚本代理，不自动开启守护或检疫流程。"""
     _switch_lock.acquire()
-    icon.visible = True
-    _refresh_icon(icon)
-    _do_script_proxy(icon)
+    _do_script_proxy(view, notify_success=False)
     try:
-        from workpal.features import autostart
-
-        autostart.refresh_autostart_status_async(
-            on_done=lambda: icon.update_menu(),
-        )
+        autostart.refresh_autostart_status_async(on_done=view.refresh)
     except Exception:
         logger.exception('启动时刷新自启动状态失败')
-    from workpal.features.session_events import session_events
-    from workpal.features.vpn_proxy import assistant
-    session_events.start(assistant.request_resume_check)
+    session_events.session_events.start(vpn_proxy.assistant.request_resume_check)
+    if is_frozen():
+        # 源码运行时 python.exe 由多个程序共用，不自动修改它的托盘显示设置。
+        threading.Thread(target=tray_promotion.promote_when_registered, args=(sys.executable, APP_NAME),
+                         kwargs={'stop': _stop_event}, daemon=True,
+                         name='tray-promotion').start()
 
 
 def initial_tray() -> None:
-    """初始化并运行系统托盘（阻塞直到退出）。"""
-    global _icon_ref
-
-    image = _load_icon('default')
-    menu = _build_menu()
-
-    icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
-    _icon_ref = icon
-
+    """初始化并运行托盘界面（阻塞直到退出）。"""
+    from workpal.ui.app import run
     try:
-        icon.run(setup=_on_tray_setup)
+        run()
     finally:
-        from workpal.features.session_events import session_events
-        session_events.stop()
+        session_events.session_events.stop()

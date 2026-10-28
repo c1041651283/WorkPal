@@ -80,10 +80,14 @@ def test_default_configuration_is_independent_of_cwd(tmp_path, monkeypatch, froz
     monkeypatch.setattr(config, 'is_frozen', lambda: frozen)
     monkeypatch.setattr(config.sys, 'executable', str(app / 'WorkPal.exe'))
     monkeypatch.setattr(config, '__file__', str(app / 'workpal' / 'config.py'))
-    monkeypatch.setattr(config, '_load_user_overrides', lambda: None)
+    monkeypatch.setattr(config, 'config_path', lambda: tmp_path / 'user' / 'network_config.ini')
+    (tmp_path / 'user').mkdir()
+    monkeypatch.setattr(config, '_load_user_overrides', lambda values: None)
     monkeypatch.setattr(config, 'CONFIG', config.CONFIG.copy())
     config.load_config()
+    # 旧配置从程序目录迁移到用户目录，而不是从当前工作目录读取。
     assert config.CONFIG['wifi_ssid'] == 'correct'
+    assert (tmp_path / 'user' / 'network_config.ini').read_text(encoding='utf-8') == 'WIFI_SSID=correct'
     config.load_config(other / 'network_config.ini')
     assert config.CONFIG['wifi_ssid'] == 'wrong'
 
@@ -112,11 +116,12 @@ def test_quit_during_network_switch_does_not_exit(monkeypatch):
     from workpal import tray
     quit_action = MagicMock()
     monkeypatch.setattr(tray, '_quit_when_idle', quit_action)
-    icon = MagicMock()
+    from tests.fake_view import FakeView
+    view = FakeView()
     with tray._switch_lock:
-        tray._on_quit(icon, None)
+        tray.quit_app(view)
     quit_action.assert_not_called()
-    icon.notify.assert_called_once()
+    assert len(view.notes) == 1
 
 
 def test_native_single_instance_excludes_another_process_and_releases(monkeypatch):

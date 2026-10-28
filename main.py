@@ -5,15 +5,21 @@ from workpal.system import get_user_data_path, is_frozen
 
 
 def _setup_logging() -> None:
+    # 指定 UTF-8，GBK 无法表示的字符（如 SSID 中的 emoji）也能记录。
     handler = RotatingFileHandler(
         get_user_data_path('app.log'),
         maxBytes=2 * 1024 * 1024,
         backupCount=1,
+        encoding='utf-8',
     )
+    handlers: list[logging.Handler] = [handler]
+    if not is_frozen():
+        # 打包的窗口程序没有控制台，sys.stderr 为 None。
+        handlers.append(logging.StreamHandler())
     logging.basicConfig(
         level=logging.INFO if is_frozen() else logging.DEBUG,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[handler, logging.StreamHandler()],
+        handlers=handlers,
     )
 
 

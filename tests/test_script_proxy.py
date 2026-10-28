@@ -8,6 +8,7 @@ import pytest
 from workpal.features import vpn_proxy as vpn
 from tests.test_vpn_proxy import ORIGINAL, manager_environment
 from tests.test_network_recovery import machine
+from tests.fake_view import FakeView
 
 
 @pytest.fixture
@@ -86,24 +87,23 @@ def test_startup_enables_script_but_leaves_manual_guard_available(script_environ
     manager, store, stack = script_environment
     stack.enter_context(patch('workpal.features.session_events.session_events.start'))
     stack.enter_context(patch('workpal.features.autostart.refresh_autostart_status_async'))
-    tray._on_tray_setup(MagicMock())
+    view = FakeView()
+    tray.startup(view)
     assert store.current.flags == 5 and not manager.active
-    guard = next(x for x in tray._build_menu().items if x.text == '代理守护')
-    labels = [x.text for x in guard.submenu.items]
-    assert '开启脚本代理（关闭手动代理）' in labels
-    assert '开始公司检疫' not in labels and '检疫已通过' not in labels
-    assert next(x for x in guard.submenu.items if x.text == '开启定时守护').enabled
+    # 启动成功不弹通知，只在失败时提示。
+    assert view.notes == []
+    assert not tray.current_state().guard_active
 
 
 def test_guard_start_during_script_change_is_rejected_then_available():
     from workpal import tray
     with patch.object(vpn, 'assistant') as manager:
         with tray._switch_lock:
-            tray._on_proxy_guard_start(MagicMock(), None)
-            tray._on_proxy_check(MagicMock(), None)
-            tray._on_vpn_start(MagicMock(), None)
+            tray.start_guard(FakeView())
+            tray.check_now(FakeView())
+            tray.connect_home(FakeView())
         manager.start.assert_not_called()
-        tray._on_proxy_guard_start(MagicMock(), None)
+        tray.start_guard(FakeView())
         manager.start.assert_called_once()
 
 
@@ -114,20 +114,48 @@ def test_startup_failure_is_reported_without_locking_guard_menu(script_environme
     stack.enter_context(patch('workpal.features.session_events.session_events.start'))
     stack.enter_context(patch('workpal.features.autostart.refresh_autostart_status_async'))
     notify = stack.enter_context(patch.object(tray, '_vpn_notify'))
-    icon = MagicMock()
-    tray._on_tray_setup(icon)
+    tray.startup(FakeView())
     assert '切换脚本代理失败' in notify.call_args.args[1]
-    assert not tray._switch_lock.locked() and icon.visible
+    assert not tray._switch_lock.locked()
     assert not store.writes and not manager.active
 
 
 def test_wired_switch_does_not_automatically_start_proxy_guard(machine):
     from workpal import tray
-    with patch.object(vpn, 'assistant') as manager, patch.object(tray.network, 'get_current_mode', return_value='wifi'), \
-         patch.object(tray.network, 'switch_to_ethernet', return_value=(True, '')), patch.object(tray, '_set_icon'):
+    with patch.object(vpn, 'assistant', active=False) as manager, \
+         patch.object(tray.network, 'get_current_mode', return_value='wifi'), \
+         patch.object(tray.network, 'switch_to_ethernet', return_value=(True, '')):
         tray._switch_lock.acquire()
-        tray._do_switch_and_release(MagicMock())
+        tray._do_switch_and_release(FakeView())
     manager.start.assert_not_called()
+
+
+def test_switch_while_guard_runs_restores_script_proxy_first(machine):
+    from workpal import tray
+    calls = []
+    view = FakeView()
+    with patch.object(vpn, 'assistant', active=True), \
+         patch.object(vpn, 'use_script_proxy', side_effect=lambda: calls.append('script')), \
+         patch.object(tray.network, 'switch_to_wifi', side_effect=lambda: calls.append('wifi') or (True, '')):
+        tray._switch_lock.acquire()
+        tray._do_switch_and_release(view, 'wifi')
+    assert calls == ['script', 'wifi']
+    assert any('切回脚本代理' in text for text in view.texts())
+    assert view.last.title == '已切换到WiFi' and view.last.level == 'success'
+    assert not tray._switch_lock.locked()
+
+
+def test_switch_is_aborted_when_script_proxy_fails(machine):
+    from workpal import tray
+    view = FakeView()
+    with patch.object(vpn, 'assistant', active=True), \
+         patch.object(vpn, 'use_script_proxy', side_effect=RuntimeError('busy')), \
+         patch.object(tray.network, 'switch_to_ethernet') as switch:
+        tray._switch_lock.acquire()
+        tray._do_switch_and_release(view, 'ethernet')
+    switch.assert_not_called()
+    assert view.last.title == '未切换网络' and view.last.level == 'error'
+    assert not tray._switching and not tray._switch_lock.locked()
 
 
 def test_existing_inspection_client_is_not_restarted_when_switching_wire(machine, monkeypatch):

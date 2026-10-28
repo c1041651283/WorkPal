@@ -6,7 +6,3 @@ pytest~=9.0
 # 打包
 pyinstaller~=6.0
 
-# 以下仅供 scripts/gen_icons.py 生成图标
-svglib
-reportlab
-rlPyCairo

@@ -129,7 +129,7 @@ class ProxySession:
     def begin(self, *, resume: bool = False) -> None:
         if self.path.exists():
             if not resume:
-                raise RuntimeError('存在上次代理备份，请先选择“恢复接管前的代理”')
+                raise RuntimeError('存在上次代理备份，未修改设置')
             # 用户再次手动开启时继续使用原备份，不把已修复的设置当成原值。
             data = json.loads(self.path.read_text(encoding='utf-8'))
             if data.get('version') != 1:
@@ -153,7 +153,7 @@ class ProxySession:
 
     def check_owned(self) -> None:
         if not self.store.read().equivalent(self.expected):
-            raise ProxyChangedExternally('代理被其他程序或手动修改，助手已停止接管，未覆盖新设置')
+            raise ProxyChangedExternally('代理被其他程序或手动修改，代理守护已停止接管，未覆盖新设置')
 
     def apply(self, settings: ProxySettings) -> None:
         self.check_owned()

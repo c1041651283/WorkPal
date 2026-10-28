@@ -15,7 +15,7 @@ oa_screenshots/
 oa_state.json
 
 # 生成的图标（由 scripts/gen_icons.py 生成，不提交二进制）
-assets/icon_*.ico
+assets/
 
 # PyInstaller 构建产物
 dist/
