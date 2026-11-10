@@ -20,6 +20,10 @@ CONFIG: dict = {
     'vpn_proxy_server': 'proxy.ricoh.co.jp:8080',
     'proxy_check_interval': '60',
     'office_pac_url': 'http://proxy.psh.com.cn/proxy-psh1.pac',
+    # 带代理启动 DeepSeek Harness：路径留空时查找常见安装位置；
+    # 直连列表另外自动包含本机回环和 DSH 配置中模型接口的主机名。
+    'dsh_path': '',
+    'dsh_no_proxy': '.psh.com.cn,.ricoh.co.jp',
 }
 
 _KEY_MAP = {
@@ -31,6 +35,8 @@ _KEY_MAP = {
     'VPN_PROXY_SERVER': 'vpn_proxy_server',
     'PROXY_CHECK_INTERVAL': 'proxy_check_interval',
     'OFFICE_PAC_URL': 'office_pac_url',
+    'DSH_PATH': 'dsh_path',
+    'DSH_NO_PROXY': 'dsh_no_proxy',
 }
 
 _DEFAULTS = dict(CONFIG)

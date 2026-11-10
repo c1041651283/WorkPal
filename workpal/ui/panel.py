@@ -196,7 +196,10 @@ class Panel(QWidget):
         self.home_row.clicked.connect(lambda: self._act(tray.connect_home))
         self.script_row = Row('script', '切回脚本代理')
         self.script_row.clicked.connect(lambda: self._act(tray.use_script))
-        for row in (self.keep_alive_row, self.guard_row, self.check_row, self.home_row, self.script_row):
+        self.dsh_row = Row('rocket', '带代理启动 DeepSeek Harness')
+        self.dsh_row.clicked.connect(lambda: self._act(tray.launch_dsh))
+        for row in (self.keep_alive_row, self.guard_row, self.check_row, self.home_row, self.script_row,
+                    self.dsh_row):
             layout.addWidget(row)
 
         layout.addSpacing(6)
@@ -338,7 +341,8 @@ class Panel(QWidget):
         self.autostart_switch.set_colors(palette, palette.accent)
         self.keep_alive_row.set_colors(palette, palette.purple)
         self.guard_row.set_colors(palette, palette.accent)
-        for row in (self.check_row, self.home_row, self.script_row, self.autostart_row, self.config_row):
+        for row in (self.check_row, self.home_row, self.script_row, self.dsh_row, self.autostart_row,
+                    self.config_row):
             row.set_colors(palette)
         if self.state is not None:
             self.update_state(self.state)
