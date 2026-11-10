@@ -65,6 +65,16 @@ Windows 系统托盘工具，专为需要在 WiFi 和有线网络间频繁切换
 
 实现依据：[Edge 代理启动参数](https://learn.microsoft.com/en-us/deployedge/edge-learnmore-cmdline-options-proxy-settings)、[WinINet 代理选项](https://learn.microsoft.com/en-us/windows/win32/api/wininet/ns-wininet-internet_per_conn_optionw)。本功能不执行 FortiClient CLI 命令，兼容本机现有的 7.2.1 客户端，不要求升级。
 
+### 带代理启动 DeepSeek Harness
+
+DeepSeek Harness（DSH）桌面版自带的 Node 不读取 Windows 系统代理，直连外网会被公司防火墙拦截，安装插件会一直停在“正在检查”。菜单中的 **带代理启动 DeepSeek Harness** 只给 DSH 进程设置以下环境变量，不修改系统或用户环境变量，其他程序不受影响：
+
+- `HTTP_PROXY` / `HTTPS_PROXY`：`VPN_PROXY_SERVER`（默认 `proxy.ricoh.co.jp:8080`）
+- `NODE_USE_ENV_PROXY=1`：让 Node 内置的 fetch 使用上述代理
+- `NO_PROXY`：本机回环地址、`DSH_NO_PROXY` 配置项，以及 DSH 配置（`%USERPROFILE%\.dsh\profiles\desktop\cordis*.yml`）中模型接口 `baseURL` 的主机名，内网模型因此保持直连
+
+DSH 只允许运行一个实例，已在运行时再次启动只会切到旧窗口，代理不会生效，因此 WorkPal 检测到 DSH 正在运行时不会启动，会提示先在 DSH 托盘中完全退出。`DSH_PATH` 留空时查找 `D:\dsh`、`C:\dsh` 等常见位置。Node 的 `NO_PROXY` 不支持 `10.0.0.0/8` 这类网段写法，需要直连的内网 IP 要逐个填写。
+
 ## 系统要求
 
 - Windows 10/11
@@ -158,6 +168,7 @@ WorkPal/
 │   │   ├── wlan.py              # Native WiFi API 只读查询 WLAN 状态和已保存配置
 │   │   ├── keep_alive.py        # 保持在线功能
 │   │   ├── vpn_proxy.py         # 代理守护及 FortiClient 状态检查
+│   │   ├── dsh_launcher.py      # 只给 DeepSeek Harness 进程注入代理环境变量
 │   │   ├── adapter_status.py    # 不依赖 WMI 的只读网卡检测
 │   │   ├── session_events.py    # Windows 唤醒/解锁事件
 │   │   ├── proxy_settings.py    # LAN 代理和持久化恢复备份

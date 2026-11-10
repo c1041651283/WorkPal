@@ -30,3 +30,15 @@ ETHERNET_PROGRAM_PATH=
 
 # 检查间隔（秒，30–3600）；托盘“检查间隔”中的选择优先于这里
 # PROXY_CHECK_INTERVAL=60
+
+# ======================== DeepSeek Harness ========================
+# 托盘“带代理启动 DeepSeek Harness”：只给 DSH 进程设置代理（使用上面的 VPN_PROXY_SERVER），
+# 不修改系统或用户环境变量，其他程序不受影响。启动前需先完全退出 DSH。
+
+# DeepSeek Harness.exe 的完整路径；留空时查找 D:\dsh、C:\dsh 等常见位置
+# DSH_PATH=D:\dsh\DeepSeek Harness.exe
+
+# 不走代理、直连的地址，逗号分隔；.example.com 表示该域名及其子域名
+# 本机回环地址和 DSH 配置中模型接口（baseURL）的主机名会自动加入，无需填写
+# 注意：不支持 10.0.0.0/8 这类网段，内网 IP 需逐个填写
+# DSH_NO_PROXY=.psh.com.cn,.ricoh.co.jp

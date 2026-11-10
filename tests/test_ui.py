@@ -124,7 +124,7 @@ def test_guard_switch_starts_guard_when_off(shown_panel):
 
 @pytest.mark.parametrize('row,action', [
     ('check_row', 'check_now'), ('home_row', 'connect_home'), ('script_row', 'use_script'),
-    ('log_button', 'open_logs'), ('quit_button', 'quit_app'),
+    ('dsh_row', 'launch_dsh'), ('log_button', 'open_logs'), ('quit_button', 'quit_app'),
 ])
 def test_action_rows_call_controller(shown_panel, row, action):
     panel, view = shown_panel

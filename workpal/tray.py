@@ -20,7 +20,8 @@ from typing import Protocol
 
 from workpal import __version__, config
 from workpal.features import (
-    adapter_status, autostart, keep_alive, network, session_events, tray_promotion, vpn_proxy,
+    adapter_status, autostart, dsh_launcher, keep_alive, network, session_events, tray_promotion,
+    vpn_proxy,
 )
 from workpal.system import get_user_data_path, is_frozen
 
@@ -436,6 +437,42 @@ def stop_guard(view: View) -> None:
         view.refresh()
 
     threading.Thread(target=worker, daemon=True, name='vpn-proxy-stop').start()
+
+
+# ---------------------------------------------------------------------------
+# 带代理启动 DeepSeek Harness
+# ---------------------------------------------------------------------------
+
+def launch_dsh(view: View) -> None:
+    """查找进程和读取 DSH 配置放到后台线程，避免界面停顿。"""
+    threading.Thread(target=_do_launch_dsh, args=(view,), daemon=True, name='dsh-launch').start()
+
+
+def _do_launch_dsh(view: View) -> None:
+    title = 'DeepSeek Harness'
+    try:
+        path = dsh_launcher.find_executable(config.CONFIG['dsh_path'])
+        if path is None:
+            configured = config.CONFIG['dsh_path'].strip()
+            detail = (f'配置的路径不存在：{configured}' if configured
+                      else '请在配置文件中填写 DSH_PATH（DeepSeek Harness.exe 的完整路径）')
+            view.notify('未找到 DeepSeek Harness', detail, level='error', key='dsh')
+            return
+        # DSH 只允许一个实例：已在运行时再次启动只会切到旧窗口，代理变量不会生效。
+        if dsh_launcher.is_running():
+            view.notify(f'{title} 已在运行', '请先在 DSH 托盘中完全退出，再从这里启动，代理才会生效',
+                        level='error', key='dsh')
+            return
+        server = config.CONFIG['vpn_proxy_server']
+        no_proxy = dsh_launcher.no_proxy_list(config.CONFIG['dsh_no_proxy'])
+        env = dsh_launcher.build_env(dict(os.environ), server, no_proxy)
+        dsh_launcher.launch(path, env)
+        logger.info(f'已带代理启动 {path} | 代理={server} | 直连={",".join(no_proxy)}')
+        view.notify(f'已带代理启动 {title}', f'外网经 {server}，内网模型直连', level='success',
+                    key='dsh')
+    except Exception as exc:
+        logger.exception('启动 DeepSeek Harness 失败')
+        view.notify(f'启动 {title} 失败', str(exc), level='error', key='dsh')
 
 
 # ---------------------------------------------------------------------------
